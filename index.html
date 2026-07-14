@@ -14,9 +14,10 @@
         <header class="win-head" data-tauri-drag-region>
           <span class="win-logo" data-tauri-drag-region>↓</span>
           <span class="win-title" data-tauri-drag-region>FETCH</span>
-          <span class="win-sub text-muted" data-tauri-drag-region>v0.1 · yt-dlp + ffmpeg</span>
+          <span class="win-sub text-muted" data-tauri-drag-region>by Ca</span>
           <span id="statusTag"></span>
           <span class="win-chrome">
+            <button id="settingsToggle" title="Settings">⚙</button>
             <button id="themeToggle" title="Toggle theme">◐</button>
             <button id="winMinimize" title="Minimize">–</button>
             <button id="winClose" title="Close">✕</button>
@@ -24,8 +25,12 @@
         </header>
 
         <!-- body: rendered per-state by main.ts -->
-        <main class="win-body" id="body"></main>
+        <main class="win-body-outer">
+          <div class="win-body" id="body"></div>
+          <div class="toast-wrap hidden" id="toastWrap"></div>
+        </main>
       </div>
+      <div class="modal-overlay hidden" id="settingsOverlay"></div>
     </div>
   </body>
 </html>

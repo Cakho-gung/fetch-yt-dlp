@@ -58,7 +58,6 @@ type Screen =
   | "playlist"
   | "mix"
   | "downloading"
-  | "success"
   | "error"
   | "installing";
 
@@ -75,8 +74,9 @@ const state = {
   analysis: null as AnalyzeResult | null,
   tab: "video" as "video" | "audio",
   selectedQualityId: "",
-  embedSubs: true,
-  embedMeta: true,
+  writeThumbnail: false,
+  writeDescription: false,
+  writeSubs: false,
   errorMsg: "",
   job: null as null | {
     id: string;
@@ -87,13 +87,19 @@ const state = {
     name: string;
     sizeLabel: string;
   },
-  lastResult: null as null | HistoryItem,
   history: [] as HistoryItem[],
   // playlist selection
   entrySelected: [] as boolean[],
   mixMode: "single" as "single" | "capped",
   mixN: 10,
+  // settings
+  settingsOpen: false,
+  cookieMode: "none" as "none" | "browser" | "file",
+  cookieBrowser: "chrome",
+  cookieFile: "",
 };
+
+const COOKIE_BROWSERS = ["chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari"];
 
 // ── helpers ──────────────────────────────────────────────────────────────
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
@@ -150,6 +156,10 @@ const isLikelyUrl = (s: string) => /^https?:\/\/\S+\.\S+/.test(s.trim());
 const corners = `<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>`;
 
 // ── rendering ────────────────────────────────────────────────────────────
+// tracks the last screen the entrance animation actually played for, so
+// in-place updates (tab switch, quality pick, checkbox, playlist selection)
+// don't replay the whole-block fade/slide — only a real screen change does.
+let lastAnimScreen: Screen | null = null;
 function render() {
   updateStatusTag();
   const el = body();
@@ -170,9 +180,6 @@ function render() {
     case "downloading":
       el.innerHTML = viewDownloading();
       break;
-    case "success":
-      el.innerHTML = viewSuccess();
-      break;
     case "error":
       el.innerHTML = viewError();
       break;
@@ -181,6 +188,18 @@ function render() {
       break;
   }
   wireEvents();
+  renderSettingsModal();
+  // replay the entrance animation only on an actual screen change — toggling
+  // the class forces a reflow so it retriggers even though #body itself never
+  // leaves the DOM. In-place updates within the same screen (tab switch,
+  // quality pick, checkboxes, playlist row toggles) skip this so the whole
+  // block doesn't fade/slide again for every small interaction.
+  if (state.screen !== lastAnimScreen) {
+    el.classList.remove("anim-in");
+    void el.offsetWidth;
+    el.classList.add("anim-in");
+    lastAnimScreen = state.screen;
+  }
 }
 
 function updateStatusTag() {
@@ -209,14 +228,21 @@ function missingBinariesWarn(): string {
   if (need.length === 0) return "";
   const canAuto = !!state.installers?.available;
   const mgr = state.installers?.manager || "brew";
+  const isBrew = mgr === "brew";
   const actions = canAuto
     ? `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
-         <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">⇣ INSTALL WITH ${esc(mgr.toUpperCase())}</button>
-         <span class="text-muted" style="font-size:11.5px">FETCH will run <code>${mgr}</code> for you — ffmpeg can take a few minutes.</span>
+         <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${
+           isBrew ? `⇣ INSTALL WITH BREW` : `⇣ DOWNLOAD YT-DLP + FFMPEG`
+         }</button>
+         <span class="text-muted" style="font-size:11.5px">${
+           isBrew
+             ? `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`
+             : `FETCH downloads portable copies into its own folder — no system install, no PATH changes. ffmpeg can take a few minutes.`
+         }</span>
        </div>`
-    : `<br>macOS: <code>brew install ${need.join(" ")}</code> &nbsp;·&nbsp; Windows: <code>winget install ${need
-        .map((n) => (n === "yt-dlp" ? "yt-dlp.yt-dlp" : "Gyan.FFmpeg"))
-        .join(" ")}</code>, then reopen FETCH.`;
+    : `<br>macOS: <code>brew install ${need.join(" ")}</code>, then reopen FETCH. On other platforms, install ${need.join(
+        " and "
+      )} manually and make sure they're on PATH.`;
   return `<div class="warn">
     <span>⚠</span>
     <div>Missing <b>${need.join(" + ")}</b> — analysis and downloads won't run until installed.${actions}</div>
@@ -228,6 +254,7 @@ function viewInstalling(): string {
   const logLines = state.installLog.slice(-200).map(esc).join("\n");
   const done = state.installDone;
   const errored = !!state.installError;
+  const needsRestart = done && need.length > 0;
   return `
   <div class="blueprint job" style="border-color:var(--color-accent)">${corners}
     <div class="job-top">
@@ -238,13 +265,19 @@ function viewInstalling(): string {
         <span class="job-stage text-muted">${
           errored
             ? esc(state.installError)
+            : needsRestart
+            ? "FETCH needs to restart to pick this up"
             : done
             ? "tools are ready"
-            : `running ${esc(state.installers?.manager ?? "installer")} — please wait`
+            : state.installers?.manager === "brew"
+            ? "running brew — please wait"
+            : "downloading — please wait"
         }</span>
       </div>
       ${
-        done || errored
+        needsRestart
+          ? `<button class="btn btn-primary" id="installRestart">⟳ RESTART APP</button>`
+          : done || errored
           ? `<button class="btn ${done ? "btn-primary" : "btn-secondary"}" id="installBack">${done ? "CONTINUE" : "BACK"}</button>`
           : ""
       }
@@ -258,12 +291,139 @@ function viewInstalling(): string {
   </div>`;
 }
 
+// Thumbnail + metadata are always embedded into the media file by the
+// backend; these checkboxes only control whether extra sidecar files
+// (thumbnail image, .info.json, .srt) get written alongside it.
+function optsRow(): string {
+  const thumb = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbThumb" ${state.writeThumbnail ? "checked" : ""}><span class="dot"></span>Thumbnail file</label>`;
+  const desc = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbDesc" ${state.writeDescription ? "checked" : ""}><span class="dot"></span>Description file</label>`;
+  const subs = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbSrt" ${state.writeSubs ? "checked" : ""}><span class="dot"></span>Subtitle file</label>`;
+  return `<div class="opts-row">${thumb}${desc}${state.tab === "video" ? subs : ""}</div>`;
+}
+
 function dirRow(): string {
   return `<div class="dir-row">
     <span class="text-muted mono">↧</span>
     <span class="path" title="${esc(state.outputDir)}">${esc(state.outputDir)}</span>
     <button class="btn btn-ghost" id="pickDir">CHANGE…</button>
   </div>`;
+}
+
+// ── settings modal ──────────────────────────────────────────────────────
+function renderSettingsModal() {
+  const overlay = document.getElementById("settingsOverlay");
+  if (!overlay || !state.settingsOpen) return;
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <span class="section-label">SETTINGS</span>
+        <span class="icon-x" id="settingsClose">✕</span>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group">
+          <span class="section-label">DOWNLOAD LOCATION</span>
+          <div class="dir-row">
+            <span class="text-muted mono">↧</span>
+            <span class="path" title="${esc(state.outputDir)}">${esc(state.outputDir)}</span>
+            <button class="btn btn-ghost" id="settingsPickDir">CHANGE…</button>
+          </div>
+        </div>
+        <div class="settings-group">
+          <span class="section-label">COOKIES</span>
+          <p class="text-muted" style="font-size:12px;margin:var(--space-1) 0 var(--space-2)">Needed for age-restricted, members-only or private videos.</p>
+          <div class="opts-row">
+            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="none" ${state.cookieMode === "none" ? "checked" : ""}><span class="dot"></span>None</label>
+            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="browser" ${state.cookieMode === "browser" ? "checked" : ""}><span class="dot"></span>Use cookies from browser</label>
+            ${
+              state.cookieMode === "browser"
+                ? `<select class="input" id="cookieBrowserSelect" style="margin-left:24px;width:auto;min-width:160px">
+                    ${COOKIE_BROWSERS.map(
+                      (b) => `<option value="${b}" ${state.cookieBrowser === b ? "selected" : ""}>${b[0].toUpperCase()}${b.slice(1)}</option>`
+                    ).join("")}
+                  </select>`
+                : ""
+            }
+            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="file" ${state.cookieMode === "file" ? "checked" : ""}><span class="dot"></span>Use a cookies.txt file</label>
+            ${
+              state.cookieMode === "file"
+                ? `<div class="dir-row" style="margin-left:24px">
+                    <span class="path" title="${esc(state.cookieFile)}">${state.cookieFile ? esc(state.cookieFile) : "no file selected"}</span>
+                    <button class="btn btn-ghost" id="pickCookieFile">CHOOSE…</button>
+                  </div>`
+                : ""
+            }
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-primary" id="settingsDone">DONE</button>
+      </div>
+    </div>`;
+  wireSettingsEvents();
+}
+
+function wireSettingsEvents() {
+  document.getElementById("settingsClose")?.addEventListener("click", closeSettings);
+  document.getElementById("settingsDone")?.addEventListener("click", closeSettings);
+  document.getElementById("settingsOverlay")?.addEventListener("click", (e) => {
+    if (e.target === document.getElementById("settingsOverlay")) closeSettings();
+  });
+  document.getElementById("settingsPickDir")?.addEventListener("click", pickDir);
+  document.getElementById("pickCookieFile")?.addEventListener("click", pickCookieFile);
+  document.getElementById("cookieBrowserSelect")?.addEventListener("change", (e) => {
+    state.cookieBrowser = (e.target as HTMLSelectElement).value;
+    persistSettings();
+  });
+  document
+    .querySelectorAll<HTMLInputElement>('input[name="cookieMode"]')
+    .forEach((r) =>
+      r.addEventListener("change", () => {
+        state.cookieMode = r.value as "none" | "browser" | "file";
+        persistSettings();
+        renderSettingsModal();
+      })
+    );
+}
+
+function openSettings() {
+  state.settingsOpen = true;
+  const overlay = document.getElementById("settingsOverlay");
+  if (!overlay) return;
+  window.clearTimeout(settingsHideTimer);
+  overlay.classList.remove("hidden");
+  renderSettingsModal();
+  requestAnimationFrame(() => overlay.classList.add("open"));
+}
+let settingsHideTimer: number | undefined;
+function closeSettings() {
+  state.settingsOpen = false;
+  const overlay = document.getElementById("settingsOverlay");
+  if (!overlay) return;
+  overlay.classList.remove("open");
+  settingsHideTimer = window.setTimeout(() => {
+    overlay.classList.add("hidden");
+    overlay.innerHTML = "";
+  }, 180);
+}
+
+async function pickCookieFile() {
+  const picked = await openDialog({
+    multiple: false,
+    filters: [{ name: "Cookies", extensions: ["txt"] }],
+  });
+  if (typeof picked === "string") {
+    state.cookieFile = picked;
+    persistSettings();
+    renderSettingsModal();
+  }
+}
+
+function cookieParams() {
+  return {
+    cookieMode: state.cookieMode,
+    cookieBrowser: state.cookieMode === "browser" ? state.cookieBrowser : null,
+    cookieFile: state.cookieMode === "file" ? state.cookieFile : null,
+  };
 }
 
 function historyStrip(): string {
@@ -280,7 +440,7 @@ function historyTable(): string {
   const rows = state.history
     .slice(0, 6)
     .map(
-      (h, i) => `<tr${i === 0 && state.screen === "success" ? ` style="background:var(--color-accent-100)"` : ""}>
+      (h, i) => `<tr>
         <td style="width:52px"><span class="tag ${i === 0 ? "tag-accent" : "tag-neutral"}">${esc(h.ext.toUpperCase())}</span></td>
         <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(h.title)}</td>
         <td class="text-muted mono" style="white-space:nowrap;font-size:11px">${esc(h.sizeLabel)} · ${relTime(h.at)}</td>
@@ -404,17 +564,15 @@ function viewAnalyzed(): string {
                </div>`
           )
           .join("")}
+        ${
+          state.tab === "audio" && a.videoOptions.length > opts.length
+            ? Array(a.videoOptions.length - opts.length)
+                .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
+                .join("")
+            : ""
+        }
       </div>
-      ${
-        state.tab === "video"
-          ? `<div class="opts-row">
-        <label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbSubs" ${state.embedSubs ? "checked" : ""}><span class="dot"></span>Subtitles (embed)</label>
-        <label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbMeta" ${state.embedMeta ? "checked" : ""}><span class="dot"></span>Thumbnail + metadata</label>
-      </div>`
-          : `<div class="opts-row">
-        <label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbMeta" ${state.embedMeta ? "checked" : ""}><span class="dot"></span>Cover art + metadata</label>
-      </div>`
-      }
+      ${optsRow()}
       <button class="btn btn-primary btn-block" id="downloadBtn">⇣ DOWNLOAD · ${fmtBytes(selected.approxBytes).replace("— MB", "best")}</button>
     </div>
   </div>
@@ -424,7 +582,13 @@ function viewAnalyzed(): string {
 
 function viewPlaylist(): string {
   const a = state.analysis!;
+  const opts = state.tab === "video" ? a.videoOptions : a.audioOptions;
+  if (!state.selectedQualityId && opts.length) {
+    state.selectedQualityId = opts.find((o) => o.id === "1080p")?.id ?? opts[0].id;
+  }
+  const selected = opts.find((o) => o.id === state.selectedQualityId) ?? opts[0];
   const count = a.playlistCount ?? a.entries.length;
+  const selCount = state.entrySelected.filter(Boolean).length;
   const rows = a.entries
     .map((e, i) => {
       const sel = state.entrySelected[i];
@@ -440,23 +604,52 @@ function viewPlaylist(): string {
       </label>`;
     })
     .join("");
-  const selCount = state.entrySelected.filter(Boolean).length;
   return `
-  <div class="link-chip" style="min-height:42px;flex:none">
-    <span class="url">${esc(a.webpageUrl)}</span>
-    <span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>
-  </div>
-  <div style="border:1px solid var(--color-divider)">
-    <div style="display:flex;align-items:center;gap:var(--space-3);padding:var(--space-3) var(--space-4);border-bottom:1px solid var(--color-divider)">
-      <span style="font:600 15px var(--font-heading)">${esc(a.title.toUpperCase())}</span>
-      <span class="text-muted mono" style="font-size:11px">${count} videos${a.entries.length < count ? ` · showing first ${a.entries.length}` : ""}</span>
-      <a href="#" id="selectAll" style="margin-left:auto;font-size:12.5px">${selCount === a.entries.length ? "Clear all" : "Select all"}</a>
+  <div class="link-row">
+    <div class="link-chip">
+      <span style="color:var(--color-accent-700);font-size:12px">✓</span>
+      <span class="url">${esc(a.webpageUrl)}</span>
+      <span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>
+      <span class="icon-x" id="clearLink">✕</span>
     </div>
-    <div style="max-height:300px;overflow:auto">${rows}</div>
-    <div style="display:flex;align-items:center;gap:var(--space-2);padding:var(--space-3) var(--space-4);border-top:1px solid var(--color-divider)">
-      <span class="mono" style="font-size:12px;color:var(--color-accent-700)">${selCount}/${a.entries.length} selected</span>
-      <button class="btn btn-secondary" id="clearLink" style="margin-left:auto">✕ CANCEL</button>
-      <button class="btn btn-primary" id="downloadPlaylist" ${selCount ? "" : "disabled"}>⇣ DOWNLOAD ${selCount} SELECTED</button>
+  </div>
+  <div class="grid-analyze">
+    <div class="blueprint preview playlist-box">${corners}
+      <div class="playlist-head">
+        <span class="ttl" title="${esc(a.title)}">${esc(a.title)}</span>
+        <span class="text-muted mono" style="font-size:11px">${count} videos${a.entries.length < count ? ` · showing first ${a.entries.length}` : ""}</span>
+        <a href="#" id="selectAll">${selCount === a.entries.length ? "Clear all" : "Select all"}</a>
+      </div>
+      <div class="playlist-rows">${rows}</div>
+      <div class="playlist-foot">
+        <span class="mono" style="font-size:12px;color:var(--color-accent-700)">${selCount}/${a.entries.length} selected</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="seg" style="align-self:stretch">
+        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="video" ${state.tab === "video" ? "checked" : ""}>Video</label>
+        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="audio" ${state.tab === "audio" ? "checked" : ""}>Audio</label>
+      </div>
+      <div class="qgrid">
+        ${opts
+          .map(
+            (o) =>
+              `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
+                 <span class="q">${esc(o.label)}</span>
+                 <span class="sz">≈ ${fmtBytes(o.approxBytes)}</span>
+               </div>`
+          )
+          .join("")}
+        ${
+          state.tab === "audio" && a.videoOptions.length > opts.length
+            ? Array(a.videoOptions.length - opts.length)
+                .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
+                .join("")
+            : ""
+        }
+      </div>
+      ${optsRow()}
+      <button class="btn btn-primary btn-block" id="downloadPlaylist" ${selCount ? "" : "disabled"}>⇣ DOWNLOAD ${selCount} SELECTED</button>
     </div>
   </div>
   ${dirRow()}`;
@@ -531,22 +724,6 @@ function viewDownloading(): string {
   </div>`;
 }
 
-function viewSuccess(): string {
-  const r = state.lastResult!;
-  return `
-  <div class="banner">
-    <span class="ok">✓</span>
-    <div class="b-txt">
-      <span class="b-ttl">DONE — SAVED TO DISK</span>
-      <span class="b-sub" title="${esc(r.path ?? "")}">${esc(r.path ?? r.title)}${r.sizeLabel ? ` · ${r.sizeLabel}` : ""}</span>
-    </div>
-    ${r.path ? `<button class="btn btn-primary open-hist" data-path="${esc(r.path)}" style="flex:none">OPEN FOLDER</button>` : ""}
-    <span class="icon-x" id="dismissBanner">✕</span>
-  </div>
-  ${linkInputRow("Paste the next link…")}
-  ${historyTable()}`;
-}
-
 function viewError(): string {
   return `
   <div class="banner error">
@@ -573,20 +750,20 @@ function wireEvents() {
   });
   $("#analyzeBtn")?.addEventListener("click", doAnalyze);
   $("#clearLink")?.addEventListener("click", resetToEmpty);
-  $("#dismissBanner")?.addEventListener("click", resetToEmpty);
   $("#backBtn")?.addEventListener("click", resetToEmpty);
   $("#pickDir")?.addEventListener("click", pickDir);
   $("#downloadBtn")?.addEventListener("click", startDownload);
   $("#cancelBtn")?.addEventListener("click", cancelDownload);
   $("#installBtn")?.addEventListener("click", startInstall);
   $("#installBack")?.addEventListener("click", finishInstall);
+  $("#installRestart")?.addEventListener("click", restartApp);
 
   // format tabs (video/audio)
   body()
     .querySelectorAll<HTMLInputElement>('input[name="fmt"]')
     .forEach((r) =>
       r.addEventListener("change", () => {
-        if (state.screen !== "analyzed") return;
+        if (state.screen !== "analyzed" && state.screen !== "playlist") return;
         state.tab = (r.value as "video" | "audio") ?? "video";
         state.selectedQualityId = "";
         render();
@@ -603,11 +780,14 @@ function wireEvents() {
       })
     );
 
-  $("#cbSubs")?.addEventListener("change", (e) => {
-    state.embedSubs = (e.target as HTMLInputElement).checked;
+  $("#cbThumb")?.addEventListener("change", (e) => {
+    state.writeThumbnail = (e.target as HTMLInputElement).checked;
   });
-  $("#cbMeta")?.addEventListener("change", (e) => {
-    state.embedMeta = (e.target as HTMLInputElement).checked;
+  $("#cbDesc")?.addEventListener("change", (e) => {
+    state.writeDescription = (e.target as HTMLInputElement).checked;
+  });
+  $("#cbSrt")?.addEventListener("change", (e) => {
+    state.writeSubs = (e.target as HTMLInputElement).checked;
   });
 
   // open folder buttons (history + success)
@@ -667,6 +847,53 @@ function resetToEmpty() {
   render();
 }
 
+// ── "done" toast — floats above whatever screen is current; opening/closing
+// only ever touches #toastWrap, never #body, so it never disrupts the user's
+// next action underneath it. Slides up from the bottom edge, auto-dismisses
+// after 5s (paused while the pointer is over it so it doesn't vanish mid-read).
+const TOAST_DURATION = 5000;
+const TOAST_TRANSITION = 220; // must match .toast-wrap .toast's transition duration in styles.css
+let toastAutoTimer: number | undefined;
+let toastCleanupTimer: number | undefined;
+
+function armToastTimer() {
+  window.clearTimeout(toastAutoTimer);
+  toastAutoTimer = window.setTimeout(dismissToast, TOAST_DURATION);
+}
+
+function showDoneToast(item: HistoryItem) {
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap) return;
+  window.clearTimeout(toastCleanupTimer);
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = `
+    <div class="banner toast">
+      <span class="ok">✓</span>
+      <div class="b-txt">
+        <span class="b-ttl">DONE — SAVED TO DISK</span>
+        <span class="b-sub" title="${esc(item.path ?? "")}">${esc(item.path ?? item.title)}${item.sizeLabel ? ` · ${item.sizeLabel}` : ""}</span>
+      </div>
+      ${item.path ? `<button class="btn btn-primary open-hist" data-path="${esc(item.path)}" style="flex:none">OPEN FOLDER</button>` : ""}
+      <span class="icon-x" id="toastClose">✕</span>
+    </div>`;
+  wrap.querySelector<HTMLElement>(".open-hist")?.addEventListener("click", (e) =>
+    invoke("reveal_in_folder", { path: (e.currentTarget as HTMLElement).dataset.path })
+  );
+  document.getElementById("toastClose")?.addEventListener("click", dismissToast);
+  requestAnimationFrame(() => wrap.classList.add("open"));
+  armToastTimer();
+}
+function dismissToast() {
+  window.clearTimeout(toastAutoTimer);
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap) return;
+  wrap.classList.remove("open");
+  toastCleanupTimer = window.setTimeout(() => {
+    wrap.classList.add("hidden");
+    wrap.innerHTML = "";
+  }, TOAST_TRANSITION);
+}
+
 function startInstall() {
   const need = missingTools();
   if (!need.length) return;
@@ -691,6 +918,10 @@ async function finishInstall() {
   resetToEmpty();
 }
 
+function restartApp() {
+  invoke("restart_app").catch(() => {});
+}
+
 function appendInstallLog() {
   const pre = $("#installLog");
   if (!pre) {
@@ -705,6 +936,7 @@ async function pickDir() {
   const picked = await openDialog({ directory: true, defaultPath: state.outputDir });
   if (typeof picked === "string") {
     state.outputDir = picked;
+    persistSettings();
     render();
   }
 }
@@ -714,7 +946,7 @@ async function doAnalyze() {
   state.screen = "analyzing";
   render();
   try {
-    const res = await invoke<AnalyzeResult>("analyze", { url: state.url });
+    const res = await invoke<AnalyzeResult>("analyze", { url: state.url, ...cookieParams() });
     state.analysis = res;
     state.selectedQualityId = "";
     state.tab = "video";
@@ -763,10 +995,10 @@ async function startDownload() {
     kind: state.tab,
     audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
     outputDir: state.outputDir,
-    embedSubs: state.embedSubs,
-    embedMetadata: state.embedMeta,
+    writeThumbnail: state.writeThumbnail,
+    writeDescription: state.writeDescription,
+    writeSubs: state.writeSubs,
     playlistItems: null,
-    title: a.title,
   });
 }
 
@@ -777,6 +1009,8 @@ function startPlaylistDownload() {
     .map((e) => e.index)
     .join(",");
   if (!items) return;
+  const sel = currentSelection();
+  if (!sel) return;
   const id = crypto.randomUUID();
   const selCount = state.entrySelected.filter(Boolean).length;
   state.job = {
@@ -793,14 +1027,14 @@ function startPlaylistDownload() {
   runDownload({
     id,
     url: a.webpageUrl,
-    formatSelector: "bv*[height<=1080]+ba/b[height<=1080]",
-    kind: "video",
-    audioFormat: null,
+    formatSelector: sel.formatSelector,
+    kind: state.tab,
+    audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
     outputDir: state.outputDir,
-    embedSubs: state.embedSubs,
-    embedMetadata: state.embedMeta,
+    writeThumbnail: state.writeThumbnail,
+    writeMetadata: state.writeMetadata,
+    writeSubs: state.writeSubs,
     playlistItems: items,
-    title: a.title,
   });
 }
 
@@ -834,16 +1068,16 @@ function mixContinue() {
       kind: "video",
       audioFormat: null,
       outputDir: state.outputDir,
-      embedSubs: state.embedSubs,
-      embedMetadata: state.embedMeta,
+      writeThumbnail: state.writeThumbnail,
+      writeMetadata: state.writeMetadata,
+      writeSubs: state.writeSubs,
       playlistItems: `1:${state.mixN}`,
-      title: a.title,
     });
   }
 }
 
 function runDownload(req: Record<string, unknown>) {
-  invoke("download", { req }).catch((err) => {
+  invoke("download", { req: { ...req, ...cookieParams() } }).catch((err) => {
     // the dl-error event already handles UI; keep this as a fallback
     if (state.screen === "downloading") {
       state.errorMsg = String(err);
@@ -884,10 +1118,9 @@ async function wireBackendEvents() {
     };
     state.history.unshift(item);
     persistHistory();
-    state.lastResult = item;
     state.job = null;
-    state.screen = "success";
-    render();
+    resetToEmpty();
+    showDoneToast(item);
   });
 
   await listen<{ id: string; message: string }>("dl-error", (e) => {
@@ -905,9 +1138,16 @@ async function wireBackendEvents() {
   });
   await listen("install-done", async () => {
     state.installDone = true;
-    try {
-      state.binaries = await invoke<Binaries>("check_binaries");
-    } catch {}
+    // Antivirus real-time scanning can briefly lock a just-downloaded .exe,
+    // so the very first check right after "done" can spuriously say it's
+    // still missing. Retry a few times before accepting that result.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        state.binaries = await invoke<Binaries>("check_binaries");
+      } catch {}
+      if (missingTools().length === 0) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
     if (state.screen === "installing") render();
   });
   await listen<string>("install-error", (e) => {
@@ -952,8 +1192,40 @@ function loadHistory() {
   } catch {}
 }
 
+function persistSettings() {
+  try {
+    localStorage.setItem(
+      "fetch.settings",
+      JSON.stringify({
+        outputDir: state.outputDir,
+        cookieMode: state.cookieMode,
+        cookieBrowser: state.cookieBrowser,
+        cookieFile: state.cookieFile,
+      })
+    );
+  } catch {}
+}
+let hasSavedOutputDir = false;
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem("fetch.settings");
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (typeof s.outputDir === "string" && s.outputDir) {
+      state.outputDir = s.outputDir;
+      hasSavedOutputDir = true;
+    }
+    if (s.cookieMode === "none" || s.cookieMode === "browser" || s.cookieMode === "file") {
+      state.cookieMode = s.cookieMode;
+    }
+    if (typeof s.cookieBrowser === "string" && s.cookieBrowser) state.cookieBrowser = s.cookieBrowser;
+    if (typeof s.cookieFile === "string") state.cookieFile = s.cookieFile;
+  } catch {}
+}
+
 // ── theme toggle ─────────────────────────────────────────────────────────
 function wireChrome() {
+  $("#settingsToggle")?.addEventListener("click", openSettings);
   $("#themeToggle")?.addEventListener("click", () => {
     const app = $("#app")!;
     const dark = app.getAttribute("data-theme") === "dark";
@@ -966,13 +1238,21 @@ function wireChrome() {
   const win = getCurrentWindow();
   $("#winMinimize")?.addEventListener("click", () => win.minimize());
   $("#winClose")?.addEventListener("click", () => win.close());
+
+  // pause the toast's auto-dismiss while the pointer is over it
+  const toastWrap = $("#toastWrap")!;
+  toastWrap.addEventListener("mouseenter", () => window.clearTimeout(toastAutoTimer));
+  toastWrap.addEventListener("mouseleave", () => {
+    if (toastWrap.classList.contains("open")) armToastTimer();
+  });
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", async () => {
   loadHistory();
+  loadSettings();
   wireChrome();
-  state.outputDir = "~/Downloads/Fetch";
+  if (!hasSavedOutputDir) state.outputDir = "~/Downloads/Fetch";
   render(); // paint immediately; backend calls below only enrich the view
 
   try {
@@ -980,9 +1260,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     console.warn("Tauri events unavailable (running outside the app shell):", e);
   }
-  try {
-    state.outputDir = await invoke<string>("default_download_dir");
-  } catch {}
+  if (!hasSavedOutputDir) {
+    try {
+      state.outputDir = await invoke<string>("default_download_dir");
+    } catch {}
+  }
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
   } catch {

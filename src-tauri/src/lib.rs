@@ -3,6 +3,7 @@
 // frontend drives everything through the commands below; long-running
 // downloads stream progress back as events.
 
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,10 +16,26 @@ use tokio::process::{Child, Command};
 // ── binary resolution ────────────────────────────────────────────────────
 // GUI apps on macOS launch with a bare PATH that misses Homebrew, so we probe
 // the usual install dirs ourselves and hand yt-dlp an augmented PATH so it can
-// in turn find ffmpeg.
+// in turn find ffmpeg. On Windows we don't touch PATH/the registry at all —
+// yt-dlp.exe/ffmpeg.exe are downloaded straight into `portable_bin_dir()`,
+// an app-owned folder that's always searched first.
+
+const APP_ID: &str = "com.fetch.downloader"; // must match tauri.conf.json "identifier"
+
+/// App-owned folder that holds our own copies of yt-dlp/ffmpeg. Nothing is
+/// installed system-wide, so uninstalling FETCH just means deleting its own
+/// folders — no leftover PATH entries, registry keys, or shared runtimes.
+fn portable_bin_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(APP_ID).join("bin")
+}
 
 fn extra_bin_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![
+        portable_bin_dir(),
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
@@ -37,6 +54,76 @@ fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Windows caches PATH in each process's environment block at creation time.
+/// Installers like winget update the *registry* and broadcast a change
+/// notification, but nothing forces an already-running process (or a shell
+/// spawned before the install, e.g. a dev-mode terminal) to reload it — so
+/// a self-relaunch that just inherits our own env won't see new tools
+/// either. Read the live value straight from the registry instead.
+#[cfg(windows)]
+fn live_path_dirs() -> Vec<PathBuf> {
+    fn read(key: &winreg::RegKey, subkey: &str) -> Option<String> {
+        key.open_subkey(subkey).ok()?.get_value::<String, _>("Path").ok()
+    }
+
+    fn expand(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            let mut name = String::new();
+            let mut closed = false;
+            for c2 in chars.by_ref() {
+                if c2 == '%' {
+                    closed = true;
+                    break;
+                }
+                name.push(c2);
+            }
+            match (closed, std::env::var(&name)) {
+                (true, Ok(val)) => out.push_str(&val),
+                (true, Err(_)) => {
+                    out.push('%');
+                    out.push_str(&name);
+                    out.push('%');
+                }
+                (false, _) => {
+                    out.push('%');
+                    out.push_str(&name);
+                }
+            }
+        }
+        out
+    }
+
+    let mut dirs = Vec::new();
+    if let Some(raw) = read(winreg::HKCU, "Environment") {
+        dirs.extend(std::env::split_paths(&expand(&raw)));
+    }
+    if let Some(raw) = read(
+        winreg::HKLM,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+    ) {
+        dirs.extend(std::env::split_paths(&expand(&raw)));
+    }
+    if dirs.is_empty() {
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+    }
+    dirs
+}
+
+#[cfg(not(windows))]
+fn live_path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default()
+}
+
 /// Resolve a binary to an absolute path if we can find it in PATH or a known dir.
 fn resolve_binary(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
@@ -51,13 +138,11 @@ fn resolve_binary(name: &str) -> Option<PathBuf> {
             return Some(cand);
         }
     }
-    // 2) PATH
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join(&exe);
-            if cand.is_file() {
-                return Some(cand);
-            }
+    // 2) PATH (live from the registry on Windows, process env elsewhere)
+    for dir in live_path_dirs() {
+        let cand = dir.join(&exe);
+        if cand.is_file() {
+            return Some(cand);
         }
     }
     None
@@ -66,9 +151,7 @@ fn resolve_binary(name: &str) -> Option<PathBuf> {
 /// PATH string that includes our extra dirs, so yt-dlp can locate ffmpeg.
 fn augmented_path() -> String {
     let mut parts: Vec<PathBuf> = extra_bin_dirs();
-    if let Some(path) = std::env::var_os("PATH") {
-        parts.extend(std::env::split_paths(&path));
-    }
+    parts.extend(live_path_dirs());
     std::env::join_paths(parts)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -83,6 +166,7 @@ fn ytdlp() -> Result<PathBuf, String> {
 // ── data shapes shared with the frontend ─────────────────────────────────
 
 #[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct Binaries {
     yt_dlp: bool,
     ffmpeg: bool,
@@ -127,6 +211,22 @@ struct AnalyzeResult {
     playlist_count: Option<u64>,
 }
 
+// Builds the yt-dlp cookie flags for the current settings. `mode` is
+// "browser" | "file" | anything else (treated as no cookies).
+fn cookie_args(mode: Option<&str>, browser: Option<&str>, file: Option<&str>) -> Vec<String> {
+    match mode {
+        Some("browser") => match browser.filter(|s| !s.is_empty()) {
+            Some(b) => vec!["--cookies-from-browser".into(), b.to_string()],
+            None => vec![],
+        },
+        Some("file") => match file.filter(|s| !s.is_empty()) {
+            Some(f) => vec!["--cookies".into(), f.to_string()],
+            None => vec![],
+        },
+        _ => vec![],
+    }
+}
+
 // ── commands ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -148,7 +248,12 @@ fn default_download_dir() -> String {
 }
 
 #[tauri::command]
-async fn analyze(url: String) -> Result<AnalyzeResult, String> {
+async fn analyze(
+    url: String,
+    cookie_mode: Option<String>,
+    cookie_browser: Option<String>,
+    cookie_file: Option<String>,
+) -> Result<AnalyzeResult, String> {
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("Empty link.".into());
@@ -156,15 +261,22 @@ async fn analyze(url: String) -> Result<AnalyzeResult, String> {
     let bin = ytdlp()?;
     // -J dumps a single JSON. --flat-playlist keeps playlist reads fast (we
     // only need entry titles, not each entry's full format list).
+    let mut args: Vec<String> = vec![
+        "-J".into(),
+        "--no-warnings".into(),
+        "--flat-playlist".into(),
+        "--playlist-items".into(),
+        "1:60".into(),
+    ];
+    args.extend(cookie_args(
+        cookie_mode.as_deref(),
+        cookie_browser.as_deref(),
+        cookie_file.as_deref(),
+    ));
+    args.push(url.clone());
+
     let output = Command::new(&bin)
-        .args([
-            "-J",
-            "--no-warnings",
-            "--flat-playlist",
-            "--playlist-items",
-            "1:60",
-            &url,
-        ])
+        .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -237,6 +349,7 @@ fn build_analyze_result(json: &serde_json::Value, url: &str) -> AnalyzeResult {
             })
             .unwrap_or_default();
 
+        let (video_options, audio_options) = generic_options();
         return AnalyzeResult {
             kind: if is_mix { "mix" } else { "playlist" }.to_string(),
             webpage_url: json
@@ -254,8 +367,8 @@ fn build_analyze_result(json: &serde_json::Value, url: &str) -> AnalyzeResult {
             view_count: None,
             thumbnail: None,
             extractor,
-            video_options: vec![],
-            audio_options: vec![],
+            video_options,
+            audio_options,
             playlist_count: json
                 .get("playlist_count")
                 .and_then(|v| v.as_u64())
@@ -296,8 +409,26 @@ fn build_analyze_result(json: &serde_json::Value, url: &str) -> AnalyzeResult {
     }
 }
 
-/// Build the BEST / 1080 / 720 / 480 video tiers and MP3 / M4A audio tiers,
-/// estimating file sizes from the format list where yt-dlp provides them.
+/// Same BEST / 1080 / 720 / 480 / MP3 / M4A tiers as `derive_options`, but
+/// without size estimates — used for playlists/mixes, where `--flat-playlist`
+/// never fetches each entry's format list.
+fn generic_options() -> (Vec<QualityOption>, Vec<QualityOption>) {
+    let video = vec![
+        QualityOption { id: "best".into(), label: "BEST".into(), height: None, approx_bytes: None, format_selector: "bv*+ba/b".into(), kind: "video".into() },
+        QualityOption { id: "1080p".into(), label: "1080P".into(), height: Some(1080), approx_bytes: None, format_selector: "bv*[height<=1080]+ba/b[height<=1080]".into(), kind: "video".into() },
+        QualityOption { id: "720p".into(), label: "720P".into(), height: Some(720), approx_bytes: None, format_selector: "bv*[height<=720]+ba/b[height<=720]".into(), kind: "video".into() },
+        QualityOption { id: "480p".into(), label: "480P".into(), height: Some(480), approx_bytes: None, format_selector: "bv*[height<=480]+ba/b[height<=480]".into(), kind: "video".into() },
+    ];
+    let audio = vec![
+        QualityOption { id: "mp3".into(), label: "MP3 · 192K".into(), height: None, approx_bytes: None, format_selector: "ba/b".into(), kind: "audio".into() },
+        QualityOption { id: "m4a".into(), label: "M4A · BEST".into(), height: None, approx_bytes: None, format_selector: "ba[ext=m4a]/ba/b".into(), kind: "audio".into() },
+    ];
+    (video, audio)
+}
+
+/// Build a BEST tier plus one tier per resolution the source actually offers,
+/// and MP3 / M4A audio tiers, estimating file sizes from the format list
+/// where yt-dlp provides them.
 fn derive_options(
     json: &serde_json::Value,
     duration: Option<f64>,
@@ -307,6 +438,23 @@ fn derive_options(
         .get("formats")
         .and_then(|v| v.as_array())
         .unwrap_or(&empty);
+
+    // Storyboard tiles (the mhtml sprite sheets behind the seek-bar preview)
+    // report no codec at all rather than an explicit "none", so a naive
+    // `!= Some("none")` check treats the missing field as "has video" and
+    // lets their odd little tile sizes (e.g. 106p/178p/266p) leak into the
+    // quality list. Require the field to be present and non-"none" instead,
+    // and drop mhtml formats outright as a second line of defense.
+    let is_storyboard = |f: &serde_json::Value| -> bool {
+        f.get("ext").and_then(|v| v.as_str()) == Some("mhtml")
+            || f.get("protocol").and_then(|v| v.as_str()) == Some("mhtml")
+    };
+    let has_video = |f: &serde_json::Value| -> bool {
+        !is_storyboard(f) && f.get("vcodec").and_then(|v| v.as_str()).is_some_and(|v| v != "none")
+    };
+    let has_audio = |f: &serde_json::Value| -> bool {
+        !is_storyboard(f) && f.get("acodec").and_then(|v| v.as_str()).is_some_and(|v| v != "none")
+    };
 
     let fmt_bytes = |f: &serde_json::Value| -> Option<u64> {
         f.get("filesize")
@@ -323,26 +471,15 @@ fn derive_options(
     // best audio-only stream (for muxing size estimates)
     let best_audio_bytes = formats
         .iter()
-        .filter(|f| {
-            f.get("vcodec").and_then(|v| v.as_str()) == Some("none")
-                && f.get("acodec").and_then(|v| v.as_str()) != Some("none")
-        })
+        .filter(|f| !has_video(f) && has_audio(f))
         .filter_map(fmt_bytes)
         .max()
         .unwrap_or(0);
 
-    // available video heights
-    let max_height = formats
-        .iter()
-        .filter(|f| f.get("vcodec").and_then(|v| v.as_str()) != Some("none"))
-        .filter_map(|f| f.get("height").and_then(|v| v.as_u64()))
-        .max();
-
     let bytes_for_height = |cap: u64| -> Option<u64> {
         formats
             .iter()
-            .filter(|f| f.get("vcodec").and_then(|v| v.as_str()) != Some("none"))
-            .filter(|f| f.get("acodec").and_then(|v| v.as_str()) == Some("none")) // video-only, will be muxed
+            .filter(|f| has_video(f) && !has_audio(f)) // video-only, will be muxed
             .filter(|f| f.get("height").and_then(|v| v.as_u64()).map(|h| h <= cap).unwrap_or(false))
             .filter_map(|f| {
                 let h = f.get("height").and_then(|v| v.as_u64())?;
@@ -354,33 +491,25 @@ fn derive_options(
     };
 
     let mut video = Vec::new();
-    // BEST tier — label reflects the real ceiling
-    let best_label = match max_height {
-        Some(h) if h >= 2160 => "BEST 4K",
-        Some(h) if h >= 1440 => "BEST 1440P",
-        Some(h) if h >= 1080 => "BEST 1080P",
-        _ => "BEST",
-    };
-    video.push(QualityOption {
-        id: "best".into(),
-        label: best_label.into(),
-        height: max_height,
-        approx_bytes: max_height.and_then(bytes_for_height),
-        format_selector: "bv*+ba/b".into(),
-        kind: "video".into(),
-    });
-    for cap in [1080u64, 720, 480] {
-        // only offer tiers that actually exist (<= max height)
-        if max_height.map(|m| m >= cap).unwrap_or(true) {
-            video.push(QualityOption {
-                id: format!("{cap}p"),
-                label: format!("{cap}P"),
-                height: Some(cap),
-                approx_bytes: bytes_for_height(cap),
-                format_selector: format!("bv*[height<={cap}]+ba/b[height<={cap}]"),
-                kind: "video".into(),
-            });
-        }
+    // one tier per resolution the source actually offers (not a fixed
+    // 1080/720/480 shortlist) — mirrors what yt-dlp -F would list. No
+    // separate "BEST" entry: the highest tier here already is the best.
+    let mut heights: Vec<u64> = formats
+        .iter()
+        .filter(|f| has_video(f))
+        .filter_map(|f| f.get("height").and_then(|v| v.as_u64()))
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    for cap in heights.into_iter().rev() {
+        video.push(QualityOption {
+            id: format!("{cap}p"),
+            label: format!("{cap}P"),
+            height: Some(cap),
+            approx_bytes: bytes_for_height(cap),
+            format_selector: format!("bv*[height<={cap}]+ba/b[height<={cap}]"),
+            kind: "video".into(),
+        });
     }
 
     let audio = vec![
@@ -414,11 +543,13 @@ struct DownloadRequest {
     kind: String,          // "video" | "audio"
     audio_format: Option<String>, // "mp3" | "m4a" when kind == audio
     output_dir: String,
-    embed_subs: bool,
-    embed_metadata: bool,
+    write_thumbnail: bool, // save the thumbnail as its own image file
+    write_description: bool, // save the description to a .description text file
+    write_subs: bool,      // save subtitles as their own .srt file
     playlist_items: Option<String>, // e.g. "1,3,4-6" for playlist selections
-    #[allow(dead_code)]
-    title: Option<String>,
+    cookie_mode: Option<String>,
+    cookie_browser: Option<String>,
+    cookie_file: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -458,7 +589,15 @@ async fn download(
     std::fs::create_dir_all(&req.output_dir)
         .map_err(|e| format!("Cannot create download folder: {e}"))?;
 
-    let out_tmpl = format!("{}/%(title)s.%(ext)s", req.output_dir.trim_end_matches('/'));
+    // Every video gets its own folder, named with today's date so the
+    // download dir sorts cleanly, e.g. "260715 - My Video". For playlists
+    // yt-dlp fills in %(title)s per entry, so each video still lands in its
+    // own folder rather than being pooled together.
+    let today = Local::now().format("%y%m%d");
+    let out_tmpl = format!(
+        "{}/{today} - %(title)s/%(title)s.%(ext)s",
+        req.output_dir.trim_end_matches('/')
+    );
 
     let mut args: Vec<String> = vec![
         req.url.clone(),
@@ -478,6 +617,11 @@ async fn download(
         "--print".into(),
         "after_move:FETCHFILE|%(filepath)s".into(),
     ];
+    args.extend(cookie_args(
+        req.cookie_mode.as_deref(),
+        req.cookie_browser.as_deref(),
+        req.cookie_file.as_deref(),
+    ));
 
     if req.kind == "audio" {
         let af = req.audio_format.as_deref().unwrap_or("mp3");
@@ -488,14 +632,22 @@ async fn download(
         args.push("--merge-output-format".into());
         args.push("mp4".into());
     }
-    if req.embed_metadata {
-        args.push("--embed-metadata".into());
-        args.push("--embed-thumbnail".into());
+    // Thumbnail + metadata are always embedded into the media file itself.
+    args.push("--embed-metadata".into());
+    args.push("--embed-thumbnail".into());
+
+    if req.write_thumbnail {
+        args.push("--write-thumbnail".into());
     }
-    if req.embed_subs && req.kind == "video" {
-        args.push("--embed-subs".into());
+    if req.write_description {
+        args.push("--write-description".into());
+    }
+    if req.write_subs && req.kind == "video" {
+        args.push("--write-subs".into());
         args.push("--sub-langs".into());
         args.push("en.*,en".into());
+        args.push("--convert-subs".into());
+        args.push("srt".into());
     }
     if let Some(items) = &req.playlist_items {
         if !items.is_empty() {
@@ -678,15 +830,22 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
 }
 
 // ── in-app installer ─────────────────────────────────────────────────────
-// Lets the user install the missing tools without leaving the app, by driving
-// the platform package manager (Homebrew / winget) with a live log stream.
+// Lets the user get the missing tools without leaving the app.
+//
+// - Windows: downloaded straight into `portable_bin_dir()` as standalone
+//   .exe files (yt-dlp ships one; ffmpeg's is pulled out of the official
+//   gyan.dev static build zip). Nothing touches the system PATH, the
+//   registry, or a package manager — install/uninstall is just files in one
+//   app-owned folder.
+// - macOS: still driven through Homebrew, which doesn't have the PATH/
+//   bloat problems winget had on Windows.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Installers {
-    /// A package manager we can drive is present for this platform.
+    /// An install path (package manager or direct download) is available.
     available: bool,
-    manager: String, // "brew" | "winget" | ""
+    manager: String, // "brew" | "fetch" | ""
     platform: String,
 }
 
@@ -696,7 +855,8 @@ fn detect_installers() -> Installers {
     let (available, manager) = if cfg!(target_os = "macos") {
         (resolve_binary("brew").is_some(), "brew")
     } else if cfg!(target_os = "windows") {
-        (resolve_binary("winget").is_some(), "winget")
+        // Self-contained download — always available, no external tool needed.
+        (true, "fetch")
     } else {
         (false, "")
     };
@@ -707,102 +867,207 @@ fn detect_installers() -> Installers {
     }
 }
 
-/// Build the per-platform installer invocations for the requested tools.
-fn build_install_plan(tools: &[String]) -> Result<Vec<(PathBuf, Vec<String>)>, String> {
-    if cfg!(target_os = "macos") {
-        let brew = resolve_binary("brew").ok_or(
-            "Homebrew isn't installed. Get it from https://brew.sh, then reopen FETCH.",
-        )?;
-        let mut args = vec!["install".to_string()];
-        args.extend(tools.iter().cloned());
-        Ok(vec![(brew, args)])
-    } else if cfg!(target_os = "windows") {
-        let winget = resolve_binary("winget").ok_or(
-            "winget isn't available. Install 'App Installer' from the Microsoft Store, then reopen FETCH.",
-        )?;
-        // winget installs one package id per call.
-        let plan = tools
-            .iter()
-            .map(|t| {
-                let id = match t.as_str() {
-                    "yt-dlp" => "yt-dlp.yt-dlp",
-                    "ffmpeg" => "Gyan.FFmpeg",
-                    other => other,
-                };
-                (
-                    winget.clone(),
-                    vec![
-                        "install".into(),
-                        "--id".into(),
-                        id.into(),
-                        "-e".into(),
-                        "--accept-source-agreements".into(),
-                        "--accept-package-agreements".into(),
-                    ],
-                )
-            })
-            .collect();
-        Ok(plan)
-    } else {
-        Err("Automatic install is only supported on macOS and Windows. Install yt-dlp and ffmpeg with your package manager.".into())
-    }
-}
-
 #[tauri::command]
 async fn install_tools(app: AppHandle, tools: Vec<String>) -> Result<(), String> {
     if tools.is_empty() {
         return Ok(());
     }
-    let plan = build_install_plan(&tools)?;
 
-    for (cmd, args) in plan {
-        app.emit(
-            "install-log",
-            format!("$ {} {}", cmd.file_name().and_then(|s| s.to_str()).unwrap_or("installer"), args.join(" ")),
-        )
-        .ok();
+    let result = if cfg!(target_os = "macos") {
+        install_tools_brew(&app, &tools).await
+    } else if cfg!(target_os = "windows") {
+        install_tools_portable(&app, &tools).await
+    } else {
+        Err("Automatic install is only supported on macOS and Windows. Install yt-dlp and ffmpeg with your package manager.".to_string())
+    };
 
-        let mut child = Command::new(&cmd)
-            .args(&args)
-            .env("PATH", augmented_path())
-            // brew refuses to run if it thinks it's non-interactive in odd ways;
-            // NONINTERACTIVE makes it proceed without prompting.
-            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
-            .env("NONINTERACTIVE", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to launch installer: {e}"))?;
-
-        let stdout = child.stdout.take().ok_or("no stdout")?;
-        let stderr = child.stderr.take().ok_or("no stderr")?;
-
-        let a2 = app.clone();
-        let err_handle = tokio::spawn(async move {
-            let mut r = BufReader::new(stderr).lines();
-            while let Ok(Some(l)) = r.next_line().await {
-                a2.emit("install-log", l).ok();
-            }
-        });
-        let mut r = BufReader::new(stdout).lines();
-        while let Ok(Some(l)) = r.next_line().await {
-            app.emit("install-log", l).ok();
-        }
-        let _ = err_handle.await;
-
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("Installer did not exit cleanly: {e}"))?;
-        if !status.success() {
-            let msg = "The installer reported an error. See the log above.".to_string();
-            app.emit("install-error", msg.clone()).ok();
-            return Err(msg);
-        }
+    if let Err(msg) = &result {
+        app.emit("install-error", msg.clone()).ok();
+        return result;
     }
-
     app.emit("install-done", ()).ok();
     Ok(())
+}
+
+async fn install_tools_brew(app: &AppHandle, tools: &[String]) -> Result<(), String> {
+    let brew = resolve_binary("brew")
+        .ok_or("Homebrew isn't installed. Get it from https://brew.sh, then reopen FETCH.")?;
+    let mut args = vec!["install".to_string()];
+    args.extend(tools.iter().cloned());
+
+    app.emit(
+        "install-log",
+        format!("$ {} {}", brew.file_name().and_then(|s| s.to_str()).unwrap_or("brew"), args.join(" ")),
+    )
+    .ok();
+
+    let mut child = Command::new(&brew)
+        .args(&args)
+        .env("PATH", augmented_path())
+        // brew refuses to run if it thinks it's non-interactive in odd ways;
+        // NONINTERACTIVE makes it proceed without prompting.
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("NONINTERACTIVE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to launch installer: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+
+    let a2 = app.clone();
+    let err_handle = tokio::spawn(async move {
+        let mut r = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = r.next_line().await {
+            a2.emit("install-log", l).ok();
+        }
+    });
+    let mut r = BufReader::new(stdout).lines();
+    while let Ok(Some(l)) = r.next_line().await {
+        app.emit("install-log", l).ok();
+    }
+    let _ = err_handle.await;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Installer did not exit cleanly: {e}"))?;
+    if !status.success() {
+        return Err("Homebrew reported an error. See the log above.".to_string());
+    }
+    Ok(())
+}
+
+/// Windows' own System32 copy of a tool, bypassing PATH entirely. Some
+/// machines have a different `curl`/`tar` earlier on PATH (e.g. Git for
+/// Windows' GNU tar, which — unlike the bsdtar in System32 — can't read
+/// .zip archives), so for tools we depend on for correctness we go straight
+/// to the OS-bundled copy (Windows 10 1803+ / 11) instead of trusting
+/// whichever one `resolve_binary` happens to find first.
+#[cfg(windows)]
+fn system32_bin(name: &str) -> Option<PathBuf> {
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let cand = root.join("System32").join(format!("{name}.exe"));
+    cand.is_file().then_some(cand)
+}
+
+/// Downloads `url` to `dest` via curl, writing to a `.part` file first so a
+/// failed download never leaves a half-written binary behind.
+async fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
+    let curl = system32_bin("curl")
+        .or_else(|| resolve_binary("curl"))
+        .ok_or("curl.exe not found. It ships with Windows 10/11 — check it hasn't been removed.")?;
+    let tmp = dest.with_extension("part");
+    let status = Command::new(&curl)
+        .args(["-L", "-sS", "--fail", "-o"])
+        .arg(&tmp)
+        .arg(url)
+        .status()
+        .await
+        .map_err(|e| format!("Failed to launch curl: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Download failed: {url}"));
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| format!("Couldn't save {}: {e}", dest.display()))
+}
+
+/// Recursively finds a file named `name` under `dir` (used to pull
+/// ffmpeg.exe/ffprobe.exe out of the zip's versioned `…/bin/` subfolder
+/// without having to know its exact name).
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|s| s.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn install_tools_portable(app: &AppHandle, tools: &[String]) -> Result<(), String> {
+    let bin_dir = portable_bin_dir();
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("Couldn't create {}: {e}", bin_dir.display()))?;
+
+    for tool in tools {
+        match tool.as_str() {
+            "yt-dlp" => {
+                app.emit("install-log", "Downloading yt-dlp.exe…").ok();
+                curl_download(
+                    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+                    &bin_dir.join("yt-dlp.exe"),
+                )
+                .await?;
+                app.emit("install-log", format!("Saved to {}", bin_dir.join("yt-dlp.exe").display())).ok();
+            }
+            "ffmpeg" => {
+                app.emit("install-log", "Downloading ffmpeg (~90 MB, can take a few minutes)…").ok();
+                let tmp_dir = std::env::temp_dir().join(format!("fetch-ffmpeg-{}", std::process::id()));
+                std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+                let zip_path = tmp_dir.join("ffmpeg.zip");
+
+                let dl = curl_download(
+                    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+                    &zip_path,
+                )
+                .await;
+                if let Err(e) = dl {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err(e);
+                }
+
+                app.emit("install-log", "Extracting ffmpeg…").ok();
+                // Must be the bsdtar in System32 — GNU tar (e.g. Git for Windows') can't read .zip.
+                let tar = system32_bin("tar")
+                    .ok_or("tar.exe not found in System32. It ships with Windows 10/11 — check it hasn't been removed.")?;
+                let status = Command::new(&tar)
+                    .arg("-xf")
+                    .arg(&zip_path)
+                    .arg("-C")
+                    .arg(&tmp_dir)
+                    .status()
+                    .await
+                    .map_err(|e| format!("Failed to run tar: {e}"))?;
+                if !status.success() {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    return Err("Failed to extract the ffmpeg archive.".to_string());
+                }
+
+                let mut found = 0;
+                for name in ["ffmpeg.exe", "ffprobe.exe"] {
+                    if let Some(src) = find_file(&tmp_dir, name) {
+                        std::fs::copy(&src, bin_dir.join(name))
+                            .map_err(|e| format!("Couldn't copy {name}: {e}"))?;
+                        found += 1;
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                if found < 2 {
+                    return Err("ffmpeg.exe/ffprobe.exe weren't found in the downloaded archive.".to_string());
+                }
+                app.emit("install-log", format!("Saved ffmpeg + ffprobe to {}", bin_dir.display())).ok();
+            }
+            other => {
+                app.emit("install-log", format!("Skipping unknown tool: {other}")).ok();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Relaunches FETCH. Not needed for the portable Windows install path
+/// (binaries live in `portable_bin_dir()`, which is always searched first —
+/// no restart required), but kept as a fallback for edge cases like the
+/// Homebrew path on macOS.
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -819,7 +1084,8 @@ pub fn run() {
             cancel_download,
             reveal_in_folder,
             detect_installers,
-            install_tools
+            install_tools,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

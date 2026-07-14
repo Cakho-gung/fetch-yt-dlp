@@ -24,4 +24,8 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "io-util", "macros", "rt", "sync"] }
+chrono = "0.4"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
 
