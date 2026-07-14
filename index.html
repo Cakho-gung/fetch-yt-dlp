@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FETCH — Mini Downloader</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app" data-theme="light">
+      <div class="window">
+        <!-- header -->
+        <header class="win-head" data-tauri-drag-region>
+          <span class="win-logo" data-tauri-drag-region>↓</span>
+          <span class="win-title" data-tauri-drag-region>FETCH</span>
+          <span class="win-sub text-muted" data-tauri-drag-region>v0.1 · yt-dlp + ffmpeg</span>
+          <span id="statusTag"></span>
+          <span class="win-chrome">
+            <button id="themeToggle" title="Toggle theme">◐</button>
+            <button id="winMinimize" title="Minimize">–</button>
+            <button id="winClose" title="Close">✕</button>
+          </span>
+        </header>
+
+        <!-- body: rendered per-state by main.ts -->
+        <main class="win-body" id="body"></main>
+      </div>
+    </div>
+  </body>
+</html>
