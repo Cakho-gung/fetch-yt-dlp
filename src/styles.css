@@ -466,13 +466,18 @@ img {
    App shell
    ══════════════════════════════════════════════════════════════════════ */
 #app {
-  min-height: 100vh;
+  /* Bounded to the viewport (not just min-height) so the body never grows the
+     page — content scrolls *inside* .win-body instead, which keeps the toast
+     (anchored to .win-body-outer's bottom) pinned to the viewport bottom. */
+  height: 100vh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 
 .window {
   flex: 1;
+  min-height: 0; /* let the inner scroll area shrink instead of overflowing #app */
   display: flex;
   flex-direction: column;
   background: var(--color-bg);
@@ -548,6 +553,7 @@ body,
 .win-body-outer {
   position: relative;
   flex: 1;
+  min-height: 0; /* required so .win-body can scroll rather than push this taller */
   display: flex;
   overflow: hidden;
 }

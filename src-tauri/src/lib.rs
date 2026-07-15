@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
+use std::time::SystemTime;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -163,6 +164,33 @@ fn ytdlp() -> Result<PathBuf, String> {
     })
 }
 
+fn spotdl() -> Result<PathBuf, String> {
+    resolve_binary("spotdl").ok_or_else(|| {
+        "spotDL isn't installed yet — it's what lets FETCH grab Spotify links. Install it from the prompt above (or Settings), then try again.".into()
+    })
+}
+
+/// Which downloader handles a URL. Spotify streams are DRM-protected, so
+/// yt-dlp can't touch them; those links go to spotDL instead, which reads the
+/// track/album/playlist metadata from Spotify, finds the closest match on
+/// YouTube Music, downloads that, and tags it with Spotify's metadata + cover.
+/// Everything else (YouTube, SoundCloud, Vimeo, TikTok, …) is a native yt-dlp
+/// extractor and takes the unchanged yt-dlp path.
+#[derive(PartialEq)]
+enum Source {
+    Spotify,
+    YtDlp,
+}
+
+fn url_source(url: &str) -> Source {
+    let u = url.trim().to_ascii_lowercase();
+    if u.starts_with("spotify:") || u.contains("spotify.com") {
+        Source::Spotify
+    } else {
+        Source::YtDlp
+    }
+}
+
 // ── data shapes shared with the frontend ─────────────────────────────────
 
 #[derive(Serialize, Default)]
@@ -170,8 +198,10 @@ fn ytdlp() -> Result<PathBuf, String> {
 struct Binaries {
     yt_dlp: bool,
     ffmpeg: bool,
+    spotdl: bool,
     yt_dlp_path: Option<String>,
     ffmpeg_path: Option<String>,
+    spotdl_path: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -192,6 +222,10 @@ struct PlaylistEntry {
     title: String,
     duration_seconds: Option<f64>,
     thumbnail: Option<String>,
+    // Spotify only: the individual track URL. yt-dlp playlists select entries
+    // by index (`--playlist-items`), but spotDL has no index-range option, so
+    // for Spotify we download the exact track URLs the user ticked instead.
+    url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -233,11 +267,14 @@ fn cookie_args(mode: Option<&str>, browser: Option<&str>, file: Option<&str>) ->
 fn check_binaries() -> Binaries {
     let yt = resolve_binary("yt-dlp");
     let ff = resolve_binary("ffmpeg");
+    let sp = resolve_binary("spotdl");
     Binaries {
         yt_dlp: yt.is_some(),
         ffmpeg: ff.is_some(),
+        spotdl: sp.is_some(),
         yt_dlp_path: yt.map(|p| p.to_string_lossy().into_owned()),
         ffmpeg_path: ff.map(|p| p.to_string_lossy().into_owned()),
+        spotdl_path: sp.map(|p| p.to_string_lossy().into_owned()),
     }
 }
 
@@ -262,6 +299,9 @@ async fn analyze(
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("Empty link.".into());
+    }
+    if url_source(&url) == Source::Spotify {
+        return analyze_spotify(id, jobs, url).await;
     }
     let bin = ytdlp()?;
     // -J dumps a single JSON. --flat-playlist keeps playlist reads fast (we
@@ -355,6 +395,233 @@ fn clean_ytdlp_error(raw: &str) -> String {
     }
 }
 
+// ── Spotify (spotDL) analyze ──────────────────────────────────────────────
+// `spotdl save <url> --save-file <f>` writes a JSON array of song objects
+// (one per track for an album/playlist) with Spotify's own metadata. We turn
+// that into the same AnalyzeResult the yt-dlp path produces, so the frontend
+// renders it through the identical preview / quality-picker / playlist UI —
+// just audio-only (no video tiers), since a Spotify link is always audio.
+
+async fn analyze_spotify(
+    id: String,
+    jobs: State<'_, Jobs>,
+    url: String,
+) -> Result<AnalyzeResult, String> {
+    let bin = spotdl()?;
+    let tmp = std::env::temp_dir().join(format!(
+        "fetch-spotdl-{}-{}.spotdl",
+        std::process::id(),
+        Local::now().format("%H%M%S%3f")
+    ));
+
+    let args: Vec<String> = vec![
+        "save".into(),
+        url.clone(),
+        "--save-file".into(),
+        tmp.to_string_lossy().into_owned(),
+    ];
+
+    let mut child = Command::new(&bin)
+        .args(&args)
+        .env("PATH", augmented_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to launch spotDL: {e}"))?;
+
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+
+    // register for cancellation (a fresh analyze kills this one via cancel_analyze)
+    jobs.0.lock().unwrap().insert(id.clone(), child);
+
+    // Drain both pipes so spotDL never blocks writing to a full one.
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    let mut stdout_buf = Vec::new();
+    let _ = stdout.read_to_end(&mut stdout_buf).await;
+
+    let mut child = jobs
+        .0
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or("Analysis was cancelled.")?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("spotDL did not exit cleanly: {e}"))?;
+    let stderr_buf = stderr_handle.await.unwrap_or_default();
+
+    // spotDL writes the metadata to the save-file, not stdout. Read it back,
+    // then clean up regardless of outcome.
+    let file = std::fs::read_to_string(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+
+    let json: serde_json::Value = match file {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("Could not parse spotDL output: {e}"))?,
+        Err(_) => {
+            let err = String::from_utf8_lossy(&stderr_buf);
+            return Err(if status.success() {
+                "spotDL couldn't read anything from that Spotify link.".to_string()
+            } else {
+                clean_spotdl_error(&err)
+            });
+        }
+    };
+
+    build_spotify_result(&json, &url)
+}
+
+fn clean_spotdl_error(raw: &str) -> String {
+    // spotDL doesn't prefix errors like yt-dlp's "ERROR:", so surface the last
+    // line that looks like an error rather than the whole log.
+    for line in raw.lines().rev() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if l.contains("Error")
+            || l.contains("error")
+            || l.contains("No results")
+            || l.contains("not found")
+        {
+            return l.to_string();
+        }
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "spotDL could not read that Spotify link.".to_string()
+    } else {
+        trimmed.lines().last().unwrap_or("Unknown error").to_string()
+    }
+}
+
+/// The audio tiers offered for every source. ORIGINAL keeps the source codec
+/// untouched (no re-encode → truly best quality, smallest file); M4A extracts
+/// to AAC; the MP3 tiers re-encode at a fixed bitrate (for device
+/// compatibility — note the source is already lossy, so a higher MP3 bitrate
+/// only means a bigger file, not more real quality). The `id` encodes the
+/// choice ("original" | "m4a" | "mp3-320" | …) and the downloader (yt-dlp or
+/// spotDL) maps it to the right flags. Sizes are estimated only when we know
+/// the source audio size + duration (a single yt-dlp video); playlists and
+/// Spotify pass None and just omit the estimate.
+fn audio_tiers(duration: Option<f64>, best_audio_bytes: Option<u64>) -> Vec<QualityOption> {
+    let mp3_bytes = |kbps: u64| duration.map(|d| (kbps as f64 * 1000.0 / 8.0 * d) as u64);
+    let mk = |id: &str, label: &str, bytes: Option<u64>, sel: &str| QualityOption {
+        id: id.into(),
+        label: label.into(),
+        height: None,
+        approx_bytes: bytes,
+        format_selector: sel.into(),
+        kind: "audio".into(),
+    };
+    vec![
+        mk("original", "ORIGINAL · BEST", best_audio_bytes, "ba/b"),
+        mk("m4a", "M4A · BEST", best_audio_bytes, "ba[ext=m4a]/ba/b"),
+        mk("mp3-320", "MP3 · 320K", mp3_bytes(320), "ba/b"),
+        mk("mp3-256", "MP3 · 256K", mp3_bytes(256), "ba/b"),
+        mk("mp3-192", "MP3 · 192K", mp3_bytes(192), "ba/b"),
+        mk("mp3-128", "MP3 · 128K", mp3_bytes(128), "ba/b"),
+    ]
+}
+
+/// Audio tiers for a Spotify link — same list, but spotDL exposes no per-format
+/// sizes so all estimates are None. The `format_selector` is unused for spotDL
+/// (it downloads by `--format`/`--bitrate`, mapped from the tier `id`).
+fn spotify_audio_options() -> Vec<QualityOption> {
+    audio_tiers(None, None)
+}
+
+fn build_spotify_result(json: &serde_json::Value, url: &str) -> Result<AnalyzeResult, String> {
+    let songs = json
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("No tracks found for that Spotify link.")?;
+
+    let str_at = |s: &serde_json::Value, k: &str| {
+        s.get(k).and_then(|v| v.as_str()).map(|v| v.to_string())
+    };
+    let artist_of = |s: &serde_json::Value| {
+        str_at(s, "artist").or_else(|| {
+            s.get("artists")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        })
+    };
+    // spotDL stores duration in seconds, but guard in case a build reports ms.
+    let dur_of = |s: &serde_json::Value| {
+        s.get("duration").and_then(|v| v.as_f64()).map(|d| if d > 86_400.0 { d / 1000.0 } else { d })
+    };
+
+    // A single track → the plain "video" (audio) preview screen; an
+    // album/playlist → the playlist screen with per-track selection.
+    if songs.len() == 1 {
+        let s = &songs[0];
+        return Ok(AnalyzeResult {
+            kind: "video".to_string(),
+            webpage_url: str_at(s, "url").unwrap_or_else(|| url.to_string()),
+            title: str_at(s, "name").unwrap_or_else(|| "Untitled".to_string()),
+            uploader: artist_of(s),
+            duration_seconds: dur_of(s),
+            view_count: None,
+            thumbnail: str_at(s, "cover_url"),
+            extractor: "Spotify".to_string(),
+            video_options: vec![],
+            // Duration lets the MP3 tiers show a size estimate (bitrate × time);
+            // ORIGINAL/M4A stay blank since spotDL doesn't expose the source size.
+            audio_options: audio_tiers(dur_of(s), None),
+            entries: vec![],
+            playlist_count: None,
+        });
+    }
+
+    let entries: Vec<PlaylistEntry> = songs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let name = str_at(s, "name").unwrap_or_else(|| format!("Track {}", i + 1));
+            let title = match artist_of(s) {
+                Some(a) => format!("{a} — {name}"),
+                None => name,
+            };
+            PlaylistEntry {
+                index: s.get("list_position").and_then(|v| v.as_u64()).unwrap_or((i as u64) + 1),
+                title,
+                duration_seconds: dur_of(s),
+                thumbnail: str_at(s, "cover_url"),
+                url: str_at(s, "url"),
+            }
+        })
+        .collect();
+
+    let title = str_at(&songs[0], "list_name")
+        .or_else(|| str_at(&songs[0], "album_name"))
+        .unwrap_or_else(|| "Spotify Playlist".to_string());
+
+    Ok(AnalyzeResult {
+        kind: "playlist".to_string(),
+        webpage_url: url.to_string(),
+        title,
+        uploader: None,
+        duration_seconds: None,
+        view_count: None,
+        thumbnail: str_at(&songs[0], "cover_url"),
+        extractor: "Spotify".to_string(),
+        video_options: vec![],
+        audio_options: spotify_audio_options(),
+        playlist_count: Some(entries.len() as u64),
+        entries,
+    })
+}
+
 fn build_analyze_result(json: &serde_json::Value, url: &str) -> AnalyzeResult {
     let typ = json.get("_type").and_then(|v| v.as_str()).unwrap_or("video");
     let extractor = json
@@ -387,6 +654,7 @@ fn build_analyze_result(json: &serde_json::Value, url: &str) -> AnalyzeResult {
                                 .and_then(|t| t.get("url"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            url: None,
                         })
                     })
                     .collect()
@@ -463,11 +731,7 @@ fn generic_options() -> (Vec<QualityOption>, Vec<QualityOption>) {
         QualityOption { id: "720p".into(), label: "720P".into(), height: Some(720), approx_bytes: None, format_selector: "bv*[height<=720]+ba/b[height<=720]".into(), kind: "video".into() },
         QualityOption { id: "480p".into(), label: "480P".into(), height: Some(480), approx_bytes: None, format_selector: "bv*[height<=480]+ba/b[height<=480]".into(), kind: "video".into() },
     ];
-    let audio = vec![
-        QualityOption { id: "mp3".into(), label: "MP3 · 192K".into(), height: None, approx_bytes: None, format_selector: "ba/b".into(), kind: "audio".into() },
-        QualityOption { id: "m4a".into(), label: "M4A · BEST".into(), height: None, approx_bytes: None, format_selector: "ba[ext=m4a]/ba/b".into(), kind: "audio".into() },
-    ];
-    (video, audio)
+    (video, audio_tiers(None, None))
 }
 
 /// Build a BEST tier plus one tier per resolution the source actually offers,
@@ -556,24 +820,10 @@ fn derive_options(
         });
     }
 
-    let audio = vec![
-        QualityOption {
-            id: "mp3".into(),
-            label: "MP3 · 192K".into(),
-            height: None,
-            approx_bytes: if best_audio_bytes > 0 { Some(best_audio_bytes) } else { None },
-            format_selector: "ba/b".into(),
-            kind: "audio".into(),
-        },
-        QualityOption {
-            id: "m4a".into(),
-            label: "M4A · BEST".into(),
-            height: None,
-            approx_bytes: if best_audio_bytes > 0 { Some(best_audio_bytes) } else { None },
-            format_selector: "ba[ext=m4a]/ba/b".into(),
-            kind: "audio".into(),
-        },
-    ];
+    let audio = audio_tiers(
+        duration,
+        if best_audio_bytes > 0 { Some(best_audio_bytes) } else { None },
+    );
 
     (video, audio)
 }
@@ -611,6 +861,9 @@ struct ProgressPayload {
 struct DonePayload {
     id: String,
     filepath: Option<String>,
+    // Actual bytes on disk (summed across every file this job wrote), so the
+    // frontend can show the real size instead of the pre-download estimate.
+    filesize: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -629,6 +882,9 @@ async fn download(
     jobs: State<'_, Jobs>,
     req: DownloadRequest,
 ) -> Result<(), String> {
+    if url_source(&req.url) == Source::Spotify {
+        return download_spotify(app, jobs, req).await;
+    }
     let bin = ytdlp()?;
     std::fs::create_dir_all(&req.output_dir)
         .map_err(|e| format!("Cannot create download folder: {e}"))?;
@@ -668,10 +924,22 @@ async fn download(
     ));
 
     if req.kind == "audio" {
-        let af = req.audio_format.as_deref().unwrap_or("mp3");
+        let af = req.audio_format.as_deref().unwrap_or("original");
         args.push("-x".into());
-        args.push("--audio-format".into());
-        args.push(af.into());
+        if af == "original" {
+            // No --audio-format → yt-dlp keeps the source codec (opus/m4a) and
+            // doesn't re-encode: highest fidelity, smallest file.
+        } else if let Some(kbps) = af.strip_prefix("mp3-") {
+            args.push("--audio-format".into());
+            args.push("mp3".into());
+            // Force the label's bitrate for real (K suffix = constant bitrate).
+            args.push("--audio-quality".into());
+            args.push(format!("{kbps}K"));
+        } else {
+            // "m4a" (or a legacy "mp3" with no bitrate) → extract to that codec.
+            args.push("--audio-format".into());
+            args.push(af.into());
+        }
     } else {
         args.push("--merge-output-format".into());
         args.push("mp4".into());
@@ -807,11 +1075,18 @@ async fn download(
                 tidy_description_file(p);
             }
         }
+        // Real size on disk = sum of every media file this job produced (one
+        // per video for a playlist), rather than the pre-download estimate.
+        let total_bytes: u64 = all_paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .sum();
         app.emit(
             "dl-done",
             DonePayload {
                 id: id.clone(),
                 filepath: final_path,
+                filesize: (total_bytes > 0).then_some(total_bytes),
             },
         )
         .ok();
@@ -856,6 +1131,252 @@ fn tidy_description_file(media_path: &str) {
     if std::fs::write(&md_path, content).is_ok() {
         let _ = std::fs::remove_file(&desc_path);
     }
+}
+
+// ── Spotify (spotDL) download ─────────────────────────────────────────────
+// spotDL matches each Spotify track to YouTube Music, downloads it, and
+// embeds Spotify's tags + cover. It has no machine-parsable byte-level
+// progress like yt-dlp's --progress-template, so progress here is coarse:
+// one step per track finished (i/N), which is fine for audio (each track is
+// quick). Emits the same dl-progress / dl-done / dl-error events as the
+// yt-dlp path, so the frontend drives it through the identical download UI.
+async fn download_spotify(
+    app: AppHandle,
+    jobs: State<'_, Jobs>,
+    req: DownloadRequest,
+) -> Result<(), String> {
+    let bin = spotdl()?;
+    std::fs::create_dir_all(&req.output_dir)
+        .map_err(|e| format!("Cannot create download folder: {e}"))?;
+
+    let started = SystemTime::now();
+    // Same "{date} - title/title.ext" folder convention as the yt-dlp path,
+    // but with spotDL's own template placeholders ({title}, {output-ext}).
+    let today = Local::now().format("%y%m%d");
+    let out_tmpl = format!(
+        "{}/{today} - {{title}}/{{title}}.{{output-ext}}",
+        req.output_dir.trim_end_matches('/')
+    );
+
+    // A playlist/album download passes the exact track URLs the user ticked
+    // (newline-joined by the frontend); a single track just uses req.url.
+    let mut queries: Vec<String> = Vec::new();
+    if let Some(items) = &req.playlist_items {
+        for line in items.split('\n') {
+            let t = line.trim();
+            if !t.is_empty() {
+                queries.push(t.to_string());
+            }
+        }
+    }
+    if queries.is_empty() {
+        queries.push(req.url.clone());
+    }
+    let total = queries.len();
+
+    // Map the shared tier id onto spotDL's --format / --bitrate. "original"
+    // keeps the native YouTube codec (opus) with no bitrate re-encode; the mp3
+    // tiers force their bitrate; m4a extracts to AAC.
+    let id = req.audio_format.as_deref().unwrap_or("original");
+    let (fmt, bitrate): (&str, Option<String>) = if id == "original" {
+        ("opus", None)
+    } else if let Some(kbps) = id.strip_prefix("mp3-") {
+        ("mp3", Some(format!("{kbps}k")))
+    } else if id == "m4a" {
+        ("m4a", None)
+    } else {
+        ("mp3", None)
+    };
+    let mut args: Vec<String> = vec!["download".into()];
+    args.extend(queries);
+    args.push("--output".into());
+    args.push(out_tmpl);
+    args.push("--format".into());
+    args.push(fmt.into());
+    if let Some(b) = bitrate {
+        args.push("--bitrate".into());
+        args.push(b);
+    }
+    // Don't re-download something already there.
+    args.push("--overwrite".into());
+    args.push("skip".into());
+    // Point spotDL at our copy of ffmpeg so it doesn't depend on a system one.
+    if let Some(ff) = resolve_binary("ffmpeg") {
+        args.push("--ffmpeg".into());
+        args.push(ff.to_string_lossy().into_owned());
+    }
+    // Reuse the "subtitle file" toggle as "save synced lyrics (.lrc)".
+    if req.write_subs {
+        args.push("--generate-lrc".into());
+    }
+
+    let mut child = Command::new(&bin)
+        .args(&args)
+        .env("PATH", augmented_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to launch spotDL: {e}"))?;
+
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+
+    jobs.0.lock().unwrap().insert(req.id.clone(), child);
+    let id = req.id.clone();
+
+    // kick the UI into its "downloading" state right away
+    app.emit(
+        "dl-progress",
+        ProgressPayload {
+            id: id.clone(),
+            percent: 0.0,
+            speed: format!("0/{total} tracks"),
+            eta: String::new(),
+            stage: "downloading".into(),
+        },
+    )
+    .ok();
+
+    let err_app = app.clone();
+    let err_id = id.clone();
+    let stderr_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        let mut buf = String::new();
+        while let Ok(Some(line)) = reader.next_line().await {
+            buf.push_str(&line);
+            buf.push('\n');
+            let _ = err_app.emit("dl-log", (err_id.clone(), line));
+        }
+        buf
+    });
+
+    let mut done_count = 0usize;
+    let mut reader = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        let l = line.trim_start();
+        // spotDL prints one of these per track as it finishes.
+        if l.starts_with("Downloaded ") || l.starts_with("Skipping ") {
+            done_count += 1;
+            let percent = if total > 0 {
+                (done_count as f64 / total as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            app.emit(
+                "dl-progress",
+                ProgressPayload {
+                    id: id.clone(),
+                    percent,
+                    speed: format!("{done_count}/{total} tracks"),
+                    eta: String::new(),
+                    stage: "downloading".into(),
+                },
+            )
+            .ok();
+        }
+        let _ = app.emit("dl-log", (id.clone(), line));
+    }
+
+    let mut child = jobs
+        .0
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or("job was cancelled")?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("spotDL did not exit cleanly: {e}"))?;
+    let err_text = stderr_handle.await.unwrap_or_default();
+
+    // spotDL exits 0 even when a track couldn't be matched, so "did anything
+    // actually land on disk?" is the real success signal. `done_count > 0`
+    // also covers a re-download where every track was skipped (files already
+    // present, so nothing is newer than `started`).
+    let (produced, total_bytes) = find_media_since(Path::new(&req.output_dir), started);
+
+    if status.success() && (produced.is_some() || done_count > 0) {
+        app.emit(
+            "dl-done",
+            DonePayload {
+                id: id.clone(),
+                filepath: produced.map(|p| p.to_string_lossy().into_owned()),
+                filesize: (total_bytes > 0).then_some(total_bytes),
+            },
+        )
+        .ok();
+        Ok(())
+    } else {
+        let message = if !status.success() {
+            if err_text.trim().is_empty() {
+                "spotDL download failed.".to_string()
+            } else {
+                clean_spotdl_error(&err_text)
+            }
+        } else {
+            "No matching track was found on YouTube for this Spotify link.".to_string()
+        };
+        app.emit(
+            "dl-error",
+            ErrorPayload {
+                id,
+                message: message.clone(),
+            },
+        )
+        .ok();
+        Err(message)
+    }
+}
+
+/// Audio files under `dir` (a few levels deep) modified at or after `since` —
+/// used to recover what spotDL just wrote, since it doesn't print the final
+/// file path in a parsable form the way yt-dlp does. Returns the newest such
+/// file (for "reveal in folder") and the total bytes across all of them (for
+/// the real size, e.g. every track of a playlist).
+fn find_media_since(dir: &Path, since: SystemTime) -> (Option<PathBuf>, u64) {
+    const EXTS: [&str; 7] = ["mp3", "m4a", "opus", "flac", "ogg", "wav", "aac"];
+    fn walk(
+        dir: &Path,
+        since: SystemTime,
+        depth: u8,
+        best: &mut Option<(SystemTime, PathBuf)>,
+        total: &mut u64,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 {
+                    walk(&path, since, depth + 1, best, total);
+                }
+                continue;
+            }
+            let is_media = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| EXTS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false);
+            if !is_media {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.modified().map(|m| m >= since).unwrap_or(false) {
+                *total += meta.len();
+                if best.as_ref().map(|(t, _)| meta.modified().map(|m| m > *t).unwrap_or(false)).unwrap_or(true) {
+                    if let Ok(m) = meta.modified() {
+                        *best = Some((m, path));
+                    }
+                }
+            }
+        }
+    }
+    let mut best = None;
+    let mut total = 0u64;
+    walk(dir, since, 0, &mut best, &mut total);
+    (best.map(|(_, p)| p), total)
 }
 
 #[tauri::command]
@@ -1096,6 +1617,23 @@ async fn install_tools_macos(app: &AppHandle, tools: &[String]) -> Result<(), St
             std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
 
             app.emit("install-log", format!("Saved to {}", dest.display())).ok();
+        } else if tool == "spotdl" {
+            let bin_dir = portable_bin_dir();
+            std::fs::create_dir_all(&bin_dir)
+                .map_err(|e| format!("Couldn't create {}: {e}", bin_dir.display()))?;
+            let dest = bin_dir.join("spotdl");
+
+            app.emit("install-log", "Resolving latest spotDL release…").ok();
+            let (_, url) = spotdl_release().await?;
+            app.emit("install-log", "Downloading spotDL (portable binary)…").ok();
+            mac_curl_download(&url, &dest).await?;
+
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+
+            app.emit("install-log", format!("Saved to {}", dest.display())).ok();
         } else {
             brew_tools.push(tool.clone());
         }
@@ -1224,6 +1762,13 @@ async fn install_tools_portable(app: &AppHandle, tools: &[String]) -> Result<(),
                 }
                 app.emit("install-log", format!("Saved ffmpeg + ffprobe to {}", bin_dir.display())).ok();
             }
+            "spotdl" => {
+                app.emit("install-log", "Resolving latest spotDL release…").ok();
+                let (_, url) = spotdl_release().await?;
+                app.emit("install-log", "Downloading spotdl.exe…").ok();
+                curl_download(&url, &bin_dir.join("spotdl.exe")).await?;
+                app.emit("install-log", format!("Saved to {}", bin_dir.join("spotdl.exe").display())).ok();
+            }
             other => {
                 app.emit("install-log", format!("Skipping unknown tool: {other}")).ok();
             }
@@ -1253,6 +1798,7 @@ struct ToolUpdate {
 struct UpdateCheck {
     yt_dlp: ToolUpdate,
     ffmpeg: ToolUpdate,
+    spotdl: ToolUpdate,
 }
 
 /// Where a resolved binary came from, so `update_tool` knows how to update
@@ -1296,6 +1842,63 @@ async fn latest_ytdlp_version() -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "Unexpected response from GitHub".to_string())
+}
+
+/// Latest spotDL release tag + the download URL of the standalone binary for
+/// this platform. spotDL ships PyInstaller-built executables (no Python
+/// needed) whose asset names embed the version and OS/arch, so we can't guess
+/// a stable `latest/download/…` URL — we resolve it from the releases API.
+async fn spotdl_release() -> Result<(String, String), String> {
+    let body =
+        curl_get("https://api.github.com/repos/spotDL/spotify-downloader/releases/latest").await?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let assets = json
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .ok_or("Unexpected response from GitHub")?;
+
+    let want = if cfg!(windows) {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        return Err("spotDL only ships portable binaries for Windows and macOS. Install it with `pip install spotdl`.".to_string());
+    };
+
+    let arch = std::env::consts::ARCH; // "aarch64" | "x86_64"
+    let mut fallback: Option<String> = None;
+    for asset in assets {
+        let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let url = asset
+            .get("browser_download_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if url.is_empty() || !name.contains(want) {
+            continue;
+        }
+        if cfg!(windows) {
+            return Ok((tag, url.to_string()));
+        }
+        // macOS: prefer an asset matching this arch, else fall back to any
+        // darwin build (older releases shipped a single x86_64 binary that
+        // runs under Rosetta on Apple Silicon).
+        let arch_match = match arch {
+            "aarch64" => name.contains("arm64") || name.contains("aarch64"),
+            _ => !name.contains("arm64") && !name.contains("aarch64"),
+        };
+        if arch_match {
+            return Ok((tag, url.to_string()));
+        }
+        fallback.get_or_insert_with(|| url.to_string());
+    }
+    fallback
+        .map(|u| (tag, u))
+        .ok_or_else(|| "Couldn't find a spotDL download for this platform in the latest release.".to_string())
 }
 
 /// gyan.dev (the same source Windows' portable ffmpeg comes from) publishes
@@ -1363,6 +1966,12 @@ async fn installed_versions() -> UpdateCheck {
             .await
             .and_then(|s| parse_leading_version(&s));
     }
+    if let Some(path) = resolve_binary("spotdl") {
+        out.spotdl.source = tool_source(&path).to_string();
+        out.spotdl.current = binary_version_output(&path, "--version")
+            .await
+            .and_then(|s| parse_leading_version(&s));
+    }
     out
 }
 
@@ -1381,6 +1990,15 @@ async fn check_for_updates() -> UpdateCheck {
         if let Ok(latest) = latest_ffmpeg_version().await {
             out.ffmpeg.update_available = out.ffmpeg.current.as_deref().map(|c| c != latest).unwrap_or(false);
             out.ffmpeg.latest = Some(latest);
+        }
+    }
+
+    if !out.spotdl.source.is_empty() {
+        if let Ok((tag, _)) = spotdl_release().await {
+            let latest = tag.trim_start_matches('v').to_string();
+            out.spotdl.update_available =
+                out.spotdl.current.as_deref().map(|c| c != latest).unwrap_or(false);
+            out.spotdl.latest = Some(latest);
         }
     }
 
@@ -1411,7 +2029,27 @@ async fn update_tool(app: AppHandle, tool: String) -> Result<(), String> {
             }
         }
         "brew" => upgrade_tools_brew(&app, std::slice::from_ref(&tool)).await,
-        _ => Err(format!("{tool} wasn't installed by FETCH or Homebrew — update it manually.")),
+        // "other": found on PATH but not installed by us (a system copy from
+        // winget/choco/pip/etc.). On Windows we don't touch it — we drop our
+        // own portable copy into portable_bin_dir(), which resolve_binary()
+        // and augmented_path() both search *first*, so it shadows the system
+        // one and the update takes effect. Elsewhere we can't do that safely,
+        // so we tell the user to update it themselves (no Homebrew wording on
+        // platforms that don't have Homebrew).
+        _ => {
+            #[cfg(windows)]
+            {
+                install_tools_portable(&app, std::slice::from_ref(&tool)).await
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Err(format!("{tool} wasn't installed by FETCH or Homebrew — update it manually."))
+            }
+            #[cfg(all(not(windows), not(target_os = "macos")))]
+            {
+                Err(format!("{tool} wasn't installed by FETCH — update it with your package manager."))
+            }
+        }
     };
 
     if let Err(msg) = &result {

@@ -7,8 +7,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 interface Binaries {
   ytDlp: boolean;
   ffmpeg: boolean;
+  spotdl: boolean;
   ytDlpPath?: string;
   ffmpegPath?: string;
+  spotdlPath?: string;
 }
 interface Installers {
   available: boolean;
@@ -24,6 +26,7 @@ interface ToolUpdate {
 interface UpdateCheck {
   ytDlp: ToolUpdate;
   ffmpeg: ToolUpdate;
+  spotdl: ToolUpdate;
 }
 interface QualityOption {
   id: string;
@@ -38,6 +41,7 @@ interface PlaylistEntry {
   title: string;
   durationSeconds?: number;
   thumbnail?: string;
+  url?: string; // Spotify only: the individual track URL
 }
 interface AnalyzeResult {
   kind: "video" | "playlist" | "mix";
@@ -172,6 +176,15 @@ function detectSource(url: string): string {
 }
 const isLikelyUrl = (s: string) => /^https?:\/\/\S+\.\S+/.test(s.trim());
 
+// A user-facing file extension for an audio tier id ("mp3-320" → "mp3",
+// "m4a" → "m4a"). "original" keeps the source codec, whose real extension is
+// only known once the file lands, so it's a placeholder until then.
+function audioExtLabel(id: string): string {
+  if (id.startsWith("mp3")) return "mp3";
+  if (id === "m4a") return "m4a";
+  return "audio";
+}
+
 // registration-mark corners for a .blueprint element
 const corners = `<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>`;
 
@@ -233,20 +246,35 @@ function updateStatusTag() {
   if (!tag) return;
   if (state.screen === "downloading") {
     tag.innerHTML = `<span class="tag tag-accent">1 ACTIVE</span>`;
-  } else if (state.binaries && !state.binaries.ytDlp) {
-    tag.innerHTML = `<span class="tag tag-neutral">yt-dlp MISSING</span>`;
   } else {
-    tag.innerHTML = "";
+    const miss = missingTools();
+    tag.innerHTML = miss.length
+      ? `<span class="tag tag-neutral">${esc(miss[0])} MISSING</span>`
+      : "";
   }
+}
+
+// Which tools a given link needs: Spotify goes through spotDL (+ ffmpeg to
+// transcode), everything else through yt-dlp (+ ffmpeg to mux/extract). An
+// empty box defaults to the yt-dlp set so first-run setup still prompts for
+// the common case.
+function requiredTools(url: string): ("yt-dlp" | "ffmpeg" | "spotdl")[] {
+  return detectSource(url) === "SPOTIFY" ? ["spotdl", "ffmpeg"] : ["yt-dlp", "ffmpeg"];
 }
 
 function missingTools(): string[] {
   const b = state.binaries;
   if (!b) return [];
-  const need: string[] = [];
-  if (!b.ytDlp) need.push("yt-dlp");
-  if (!b.ffmpeg) need.push("ffmpeg");
-  return need;
+  const have: Record<string, boolean> = {
+    "yt-dlp": b.ytDlp,
+    ffmpeg: b.ffmpeg,
+    spotdl: !!b.spotdl,
+  };
+  return requiredTools(state.url).filter((t) => !have[t]);
+}
+
+function canAnalyze(): boolean {
+  return !!state.binaries && missingTools().length === 0;
 }
 
 function missingBinariesWarn(): string {
@@ -254,40 +282,43 @@ function missingBinariesWarn(): string {
   if (need.length === 0) return "";
   const canAuto = !!state.installers?.available;
   const mgr = state.installers?.manager || "brew";
-  const needsYtDlp = need.includes("yt-dlp");
-  const needsFfmpeg = need.includes("ffmpeg");
+  const needLabel = need.join(" + ").toUpperCase();
+  // On macOS ffmpeg is the only tool that goes through brew; yt-dlp and
+  // spotDL download as portable binaries. On Windows ("fetch") everything is
+  // portable.
+  const brewPart = mgr === "mac" && need.includes("ffmpeg");
 
-  let label = "⇣ INSTALL WITH BREW";
-  let desc = `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`;
+  let label: string;
+  let desc: string;
   if (mgr === "fetch") {
-    label = "⇣ DOWNLOAD YT-DLP + FFMPEG";
-    desc = `FETCH downloads portable copies into its own folder — no system install, no PATH changes. ffmpeg can take a few minutes.`;
+    label = `⇣ DOWNLOAD ${needLabel}`;
+    desc = `FETCH downloads portable copies into its own folder — no system install, no PATH changes.${need.includes("ffmpeg") ? " ffmpeg can take a few minutes." : ""}`;
   } else if (mgr === "mac") {
-    // yt-dlp downloads straight into FETCH's own folder; ffmpeg still goes
-    // through brew (no reliable portable static build for macOS).
-    if (needsYtDlp && needsFfmpeg) {
-      label = "⇣ DOWNLOAD YT-DLP + INSTALL FFMPEG";
-      desc = `yt-dlp downloads directly, no install needed; ffmpeg installs via <code>brew</code> — can take a few minutes.`;
-    } else if (needsYtDlp) {
-      label = "⇣ DOWNLOAD YT-DLP";
-      desc = `FETCH downloads a portable copy into its own folder — no system install, no PATH changes.`;
-    } else {
-      label = "⇣ INSTALL WITH BREW";
-      desc = `FETCH will run <code>brew</code> for you to install ffmpeg — can take a few minutes.`;
-    }
+    label = `⇣ INSTALL ${needLabel}`;
+    desc = brewPart
+      ? `yt-dlp/spotDL download directly; ffmpeg installs via <code>brew</code> — can take a few minutes.`
+      : `FETCH downloads portable copies into its own folder — no system install, no PATH changes.`;
+  } else {
+    label = "⇣ INSTALL WITH BREW";
+    desc = `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`;
   }
+
+  // Manual fallback (no supported auto-installer). spotDL isn't a brew formula,
+  // so point at pip for it and brew for the rest.
+  const manualBits: string[] = [];
+  const brewables = need.filter((t) => t !== "spotdl");
+  if (brewables.length) manualBits.push(`<code>brew install ${brewables.join(" ")}</code>`);
+  if (need.includes("spotdl")) manualBits.push(`<code>pip install spotdl</code>`);
 
   const actions = canAuto
     ? `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
          <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${label}</button>
          <span class="text-muted" style="font-size:11.5px">${desc}</span>
        </div>`
-    : `<br>macOS: <code>brew install ${need.join(" ")}</code>, then reopen FETCH. On other platforms, install ${need.join(
-        " and "
-      )} manually and make sure they're on PATH.`;
+    : `<br>Install with ${manualBits.join(" and ")}, then reopen FETCH (make sure they're on PATH).`;
   return `<div class="warn">
     <span>⚠</span>
-    <div>Missing <b>${need.join(" + ")}</b> — analysis and downloads won't run until installed.${actions}</div>
+    <div>Missing <b>${need.join(" + ")}</b> — this link won't analyze or download until installed.${actions}</div>
   </div>`;
 }
 
@@ -344,10 +375,31 @@ function viewInstalling(): string {
 // backend; these checkboxes only control whether extra sidecar files
 // (thumbnail image, .info.json, .srt) get written alongside it.
 function optsRow(): string {
+  // Spotify (spotDL) always embeds cover art + full tags and has no
+  // "description" concept, so the only extra sidecar it offers is synced
+  // lyrics (.lrc) — reuse the same writeSubs flag / #cbSrt handler for it.
+  if (state.analysis?.extractor === "Spotify") {
+    const lrc = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbSrt" ${state.writeSubs ? "checked" : ""}><span class="dot"></span>Lyrics (.lrc)</label>`;
+    return `<div class="opts-row">${lrc}</div>`;
+  }
   const thumb = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbThumb" ${state.writeThumbnail ? "checked" : ""}><span class="dot"></span>Thumbnail file</label>`;
   const desc = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbDesc" ${state.writeDescription ? "checked" : ""}><span class="dot"></span>Description file</label>`;
   const subs = `<label class="radio" style="font-size:12.5px"><input type="checkbox" id="cbSrt" ${state.writeSubs ? "checked" : ""}><span class="dot"></span>Subtitle file</label>`;
   return `<div class="opts-row">${thumb}${desc}${state.tab === "video" ? subs : ""}</div>`;
+}
+
+// The Video/Audio toggle. For audio-only sources (Spotify) there are no video
+// tiers, so only the Audio segment is shown.
+function fmtSegHtml(): string {
+  const hasVideo = (state.analysis?.videoOptions.length ?? 0) > 0;
+  const audio = `<label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="audio" ${state.tab === "audio" ? "checked" : ""}>Audio</label>`;
+  if (!hasVideo) {
+    return `<div class="seg" style="align-self:stretch">${audio}</div>`;
+  }
+  return `<div class="seg" style="align-self:stretch">
+        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="video" ${state.tab === "video" ? "checked" : ""}>Video</label>
+        ${audio}
+      </div>`;
 }
 
 function dirRow(): string {
@@ -407,6 +459,7 @@ function renderSettingsModal() {
           <span class="section-label">TOOLS</span>
           ${toolUpdateRow("yt-dlp", state.updateCheck?.ytDlp)}
           ${toolUpdateRow("ffmpeg", state.updateCheck?.ffmpeg)}
+          ${state.binaries?.spotdl ? toolUpdateRow("spotdl", state.updateCheck?.spotdl) : ""}
           <div class="dir-row" style="margin-top:var(--space-2)">
             <button class="btn btn-ghost" id="checkUpdatesBtn" ${state.checkingUpdates ? "disabled" : ""}>
               ${state.checkingUpdates ? "CHECKING…" : "⟳ CHECK FOR UPDATES"}
@@ -421,8 +474,8 @@ function renderSettingsModal() {
   wireSettingsEvents();
 }
 
-function toolUpdateRow(tool: "yt-dlp" | "ffmpeg", info: ToolUpdate | undefined): string {
-  const label = tool === "yt-dlp" ? "yt-dlp" : "ffmpeg";
+function toolUpdateRow(tool: "yt-dlp" | "ffmpeg" | "spotdl", info: ToolUpdate | undefined): string {
+  const label = tool;
   const current = info?.current ? esc(info.current) : "—";
   let status: string;
   if (!info) {
@@ -507,6 +560,101 @@ function closeSettings() {
   }, 180);
 }
 
+// ── help / troubleshooting modal ─────────────────────────────────────────
+// Opened from the "LEARN MORE" button on an error toast. Covers the common
+// reasons a download fails — cookies first, since that's the usual culprit
+// for sites like Douyin/TikTok and for age-restricted/private videos.
+let helpHideTimer: number | undefined;
+
+// A download error looks cookie-fixable when yt-dlp mentions cookies, sign-in,
+// age gates, or private/members-only content.
+function isCookieError(msg: string): boolean {
+  return /cookie|sign[- ]?in|log[- ]?in|login|private|age[- ]?restrict|members?-only|account|token/i.test(
+    msg
+  );
+}
+
+function helpModalHtml(highlightCookies: boolean): string {
+  const hi = highlightCookies
+    ? "border-color:var(--color-accent);background:var(--color-accent-100)"
+    : "";
+  return `
+    <div class="modal">
+      <div class="modal-head">
+        <span class="section-label">WHY A DOWNLOAD FAILS</span>
+        <span class="icon-x" id="helpClose">✕</span>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group" style="border:1px solid var(--color-divider);${hi};padding:var(--space-3)">
+          <span class="section-label">① COOKIES — the usual cause</span>
+          <p class="text-muted" style="font-size:12.5px;margin:var(--space-1) 0 var(--space-2)">
+            Some sites (Douyin, TikTok, plus age-restricted, members-only or private videos)
+            need <b>fresh browser cookies</b> — even when you're not logged in. The site uses
+            them as an anti-bot token.
+          </p>
+          <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-2)">
+            Open a page from that site in your browser once, then here:
+            <b>Settings → Cookies → "Use cookies from browser"</b> and pick that browser.
+          </p>
+          <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-2)">
+            <b>If that fails on Windows</b> (Chrome/Edge lock &amp; encrypt their cookies):
+            close the browser fully and retry, or export a <code>cookies.txt</code> with an
+            extension like "Get cookies.txt LOCALLY" and use
+            <b>"Use a cookies.txt file"</b> instead.
+          </p>
+          <button class="btn btn-primary" id="helpOpenSettings" style="font-size:12.5px">⚙ OPEN COOKIE SETTINGS</button>
+        </div>
+        <div class="settings-group">
+          <span class="section-label">② OUT-OF-DATE TOOL</span>
+          <p class="text-muted" style="font-size:12.5px;margin:var(--space-1) 0">
+            Sites change constantly. If a link that used to work suddenly stops,
+            update yt-dlp / spotDL in <b>Settings → Tools → Check for updates</b>.
+          </p>
+        </div>
+        <div class="settings-group">
+          <span class="section-label">③ REGION-LOCKED OR PRIVATE</span>
+          <p class="text-muted" style="font-size:12.5px;margin:var(--space-1) 0">
+            Some videos are blocked in your region or genuinely private —
+            those can't be fetched no matter the settings.
+          </p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-primary" id="helpDone">GOT IT</button>
+      </div>
+    </div>`;
+}
+
+function openHelp(highlightCookies = false) {
+  const overlay = document.getElementById("helpOverlay");
+  if (!overlay) return;
+  window.clearTimeout(helpHideTimer);
+  overlay.classList.remove("hidden");
+  overlay.innerHTML = helpModalHtml(highlightCookies);
+  document.getElementById("helpClose")?.addEventListener("click", closeHelp);
+  document.getElementById("helpDone")?.addEventListener("click", closeHelp);
+  document.getElementById("helpOpenSettings")?.addEventListener("click", () => {
+    closeHelp();
+    openSettings();
+  });
+  // onclick (not addEventListener) so reopening the modal doesn't stack
+  // duplicate backdrop handlers on the persistent overlay element.
+  overlay.onclick = (e) => {
+    if (e.target === overlay) closeHelp();
+  };
+  requestAnimationFrame(() => overlay.classList.add("open"));
+}
+
+function closeHelp() {
+  const overlay = document.getElementById("helpOverlay");
+  if (!overlay) return;
+  overlay.classList.remove("open");
+  helpHideTimer = window.setTimeout(() => {
+    overlay.classList.add("hidden");
+    overlay.innerHTML = "";
+  }, 180);
+}
+
 async function pickCookieFile() {
   const picked = await openDialog({
     multiple: false,
@@ -574,7 +722,7 @@ function relTime(at: number): string {
 // button) just cancels whatever analyze is in flight and starts a new one;
 // see doAnalyze(). Only the trailing status tag changes per screen.
 function linkInputRow(placeholder: string): string {
-  const canAnalyze = !!(state.binaries?.ytDlp && state.binaries?.ffmpeg);
+  const ready = canAnalyze();
   const a = state.analysis;
   let statusTag = "";
   if (a && state.screen === "playlist") {
@@ -588,11 +736,11 @@ function linkInputRow(placeholder: string): string {
   }
   return `<div class="link-row">
     <div class="link-input-wrap">
-      <input class="input" id="urlInput" placeholder="${esc(placeholder)}" value="${esc(state.url)}" spellcheck="false" autocomplete="off" ${canAnalyze ? "" : "disabled"}>
+      <input class="input" id="urlInput" placeholder="${esc(placeholder)}" value="${esc(state.url)}" spellcheck="false" autocomplete="off">
       ${state.url ? `<span class="icon-x link-clear" id="clearLink" title="Clear">✕</span>` : ""}
     </div>
     ${statusTag}
-    <button class="btn btn-primary" id="analyzeBtn" ${isLikelyUrl(state.url) && canAnalyze ? "" : "disabled"}>ANALYZE</button>
+    <button class="btn btn-primary" id="analyzeBtn" ${isLikelyUrl(state.url) && ready ? "" : "disabled"}>ANALYZE</button>
   </div>`;
 }
 
@@ -661,10 +809,7 @@ function viewAnalyzed(): string {
       </div>
     </figure>
     <div class="card">
-      <div class="seg" style="align-self:stretch">
-        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="video" ${state.tab === "video" ? "checked" : ""}>Video</label>
-        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="audio" ${state.tab === "audio" ? "checked" : ""}>Audio</label>
-      </div>
+      ${fmtSegHtml()}
       <div class="qgrid">
         ${opts
           .map(
@@ -730,10 +875,7 @@ function viewPlaylist(): string {
       </div>
     </div>
     <div class="card">
-      <div class="seg" style="align-self:stretch">
-        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="video" ${state.tab === "video" ? "checked" : ""}>Video</label>
-        <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" value="audio" ${state.tab === "audio" ? "checked" : ""}>Audio</label>
-      </div>
+      ${fmtSegHtml()}
       <div class="qgrid">
         ${opts
           .map(
@@ -1007,6 +1149,7 @@ function showErrorToast(message: string) {
   window.clearTimeout(toastCleanupTimer);
   activeToastKind = "error";
   wrap.classList.remove("hidden");
+  const cookieHint = isCookieError(message);
   wrap.innerHTML = `
     <div class="banner toast error">
       <span class="ok">!</span>
@@ -1014,9 +1157,14 @@ function showErrorToast(message: string) {
         <span class="b-ttl">COULDN'T DO THAT</span>
         <span class="b-sub" style="white-space:normal">${esc(message)}</span>
       </div>
+      <button class="btn btn-secondary" id="toastLearnMore" style="flex:none">LEARN MORE</button>
       <span class="icon-x" id="toastClose">✕</span>
     </div>`;
   document.getElementById("toastClose")?.addEventListener("click", dismissToast);
+  document.getElementById("toastLearnMore")?.addEventListener("click", () => {
+    dismissToast();
+    openHelp(cookieHint);
+  });
   requestAnimationFrame(() => wrap.classList.add("open"));
   armToastTimer();
 }
@@ -1057,6 +1205,9 @@ function pendingUpdateItems(): { tool: string; label: string; from?: string; to?
   if (result.ffmpeg.updateAvailable) {
     items.push({ tool: "ffmpeg", label: "ffmpeg", from: result.ffmpeg.current, to: result.ffmpeg.latest });
   }
+  if (result.spotdl?.updateAvailable) {
+    items.push({ tool: "spotdl", label: "spotDL", from: result.spotdl.current, to: result.spotdl.latest });
+  }
   return items;
 }
 
@@ -1089,6 +1240,7 @@ async function loadInstalledVersions() {
       ? {
           ytDlp: { ...state.updateCheck.ytDlp, current: local.ytDlp.current, source: local.ytDlp.source },
           ffmpeg: { ...state.updateCheck.ffmpeg, current: local.ffmpeg.current, source: local.ffmpeg.source },
+          spotdl: { ...state.updateCheck.spotdl, current: local.spotdl.current, source: local.spotdl.source },
         }
       : local;
     if (state.settingsOpen) renderSettingsModal();
@@ -1216,6 +1368,12 @@ async function pickDir() {
 
 async function doAnalyze() {
   if (!isLikelyUrl(state.url)) return;
+  // Missing the tool this link needs (e.g. a Spotify link with spotDL not yet
+  // installed) — kick off the install for exactly that set instead of failing.
+  if (!canAnalyze()) {
+    startInstall();
+    return;
+  }
   cancelInFlightAnalyze(); // editing + resubmitting replaces whatever was running, not queues alongside it
   const id = crypto.randomUUID();
   state.analyzingId = id;
@@ -1228,7 +1386,8 @@ async function doAnalyze() {
     state.analyzingId = null;
     state.analysis = res;
     state.selectedQualityId = "";
-    state.tab = "video";
+    // Audio-only sources (Spotify) have no video tiers — start on the audio tab.
+    state.tab = res.videoOptions.length ? "video" : "audio";
     if (res.kind === "playlist") {
       state.entrySelected = res.entries.map(() => true);
       state.screen = "playlist";
@@ -1265,7 +1424,7 @@ async function startDownload() {
     speed: "",
     eta: "",
     stage: "starting",
-    name: a.title + (state.tab === "audio" ? `.${state.selectedQualityId}` : ".mp4"),
+    name: a.title + (state.tab === "audio" ? `.${audioExtLabel(state.selectedQualityId)}` : ".mp4"),
     sizeLabel: fmtBytes(sel.approxBytes),
   };
   state.screen = "downloading";
@@ -1286,10 +1445,19 @@ async function startDownload() {
 
 function startPlaylistDownload() {
   const a = state.analysis!;
-  const items = a.entries
-    .filter((_, i) => state.entrySelected[i])
-    .map((e) => e.index)
-    .join(",");
+  const isSpotify = a.extractor === "Spotify";
+  // Spotify has no index-range selection — pass the exact track URLs the user
+  // ticked (newline-joined); yt-dlp takes a comma-separated index list.
+  const items = isSpotify
+    ? a.entries
+        .filter((_, i) => state.entrySelected[i])
+        .map((e) => e.url)
+        .filter(Boolean)
+        .join("\n")
+    : a.entries
+        .filter((_, i) => state.entrySelected[i])
+        .map((e) => e.index)
+        .join(",");
   if (!items) return;
   const sel = currentSelection();
   if (!sel) return;
@@ -1324,11 +1492,15 @@ function mixContinue() {
   const a = state.analysis!;
   // Turn the mix into a normal single-video analyze/download path.
   if (state.mixMode === "single") {
-    // re-shape analysis as a plain video by re-analyzing without the list
-    state.screen = "analyzed";
-    // strip the &list= param so download uses the single video
-    a.webpageUrl = a.webpageUrl.replace(/[?&]list=[^&]+/g, "").replace(/[?&]index=[^&]+/g, "");
-    render();
+    // Actually re-analyze just this video: the current analysis is the mix's
+    // (flat-playlist → no thumbnail, generic formats, mix title). Strip the
+    // radio/list/index params off the pasted link and run a fresh analyze so
+    // we get the real clip's title, thumbnail and per-format sizes.
+    state.url = state.url
+      .replace(/[?&]list=[^&]+/g, "")
+      .replace(/[?&]index=[^&]+/g, "")
+      .replace(/[?&]start_radio=[^&]+/g, "");
+    doAnalyze();
   } else {
     // capped: hand off to the same quality-picker screen a real playlist
     // uses, pre-selecting just the first N entries — "CONTINUE → PICK
@@ -1371,12 +1543,14 @@ async function wireBackendEvents() {
     }
   );
 
-  await listen<{ id: string; filepath?: string }>("dl-done", (e) => {
+  await listen<{ id: string; filepath?: string; filesize?: number }>("dl-done", (e) => {
     if (!state.job || state.job.id !== e.payload.id) return;
     const item: HistoryItem = {
-      title: (state.analysis?.title ?? state.job.name).replace(/\.(mp4|mp3|m4a|webm)$/i, ""),
-      ext: e.payload.filepath?.split(".").pop() ?? (state.tab === "audio" ? state.selectedQualityId : "mp4"),
-      sizeLabel: state.job.sizeLabel,
+      title: (state.analysis?.title ?? state.job.name).replace(/\.(mp4|mp3|m4a|webm|opus|flac|ogg|wav)$/i, ""),
+      ext: e.payload.filepath?.split(".").pop() ?? (state.tab === "audio" ? audioExtLabel(state.selectedQualityId) : "mp4"),
+      // Prefer the real on-disk size the backend reports; fall back to the
+      // pre-download estimate only if it's somehow missing.
+      sizeLabel: e.payload.filesize ? fmtBytes(e.payload.filesize) : state.job.sizeLabel,
       path: e.payload.filepath,
       at: Date.now(),
     };
@@ -1532,7 +1706,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
   } catch {
-    state.binaries = { ytDlp: false, ffmpeg: false };
+    state.binaries = { ytDlp: false, ffmpeg: false, spotdl: false };
   }
   try {
     state.installers = await invoke<Installers>("detect_installers");
