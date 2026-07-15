@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 // ── binary resolution ────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ fn augmented_path() -> String {
 
 fn ytdlp() -> Result<PathBuf, String> {
     resolve_binary("yt-dlp").ok_or_else(|| {
-        "yt-dlp not found. Install it (macOS: `brew install yt-dlp`) and restart FETCH.".into()
+        "yt-dlp not found. Use FETCH's installer, or `brew install yt-dlp`, then restart FETCH.".into()
     })
 }
 
@@ -247,8 +247,13 @@ fn default_download_dir() -> String {
     base.join("Downloads").join("Fetch").to_string_lossy().into_owned()
 }
 
+// Registered in `jobs` under `id` for the duration of the call so a fresh
+// analyze request (the user editing the link and resubmitting) can kill
+// this one via `cancel_analyze` instead of letting two run concurrently.
 #[tauri::command]
 async fn analyze(
+    id: String,
+    jobs: State<'_, Jobs>,
     url: String,
     cookie_mode: Option<String>,
     cookie_browser: Option<String>,
@@ -275,24 +280,63 @@ async fn analyze(
     ));
     args.push(url.clone());
 
-    let output = Command::new(&bin)
+    let mut child = Command::new(&bin)
         .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("Failed to launch yt-dlp: {e}"))?;
 
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+
+    // register for cancellation
+    jobs.0.lock().unwrap().insert(id.clone(), child);
+
+    // Read both streams concurrently (not sequentially) — -J output for a
+    // large playlist can exceed the OS pipe buffer, and reading stdout to
+    // completion before touching stderr risks a deadlock if yt-dlp is
+    // blocked writing warnings to the other pipe.
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    let mut stdout_buf = Vec::new();
+    let _ = stdout.read_to_end(&mut stdout_buf).await;
+
+    // reclaim the child and await its exit status
+    let mut child = jobs
+        .0
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or("Analysis was cancelled.")?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("yt-dlp did not exit cleanly: {e}"))?;
+    let stderr_buf = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr_buf);
         return Err(clean_ytdlp_error(&err));
     }
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let json: serde_json::Value = serde_json::from_slice(&stdout_buf)
         .map_err(|e| format!("Could not parse yt-dlp output: {e}"))?;
 
     Ok(build_analyze_result(&json, &url))
+}
+
+#[tauri::command]
+fn cancel_analyze(jobs: State<'_, Jobs>, id: String) -> Result<(), String> {
+    if let Some(mut child) = jobs.0.lock().unwrap().remove(&id) {
+        let _ = child.start_kill();
+    }
+    Ok(())
 }
 
 fn clean_ytdlp_error(raw: &str) -> String {
@@ -676,6 +720,11 @@ async fn download(
 
     let id = req.id.clone();
     let mut final_path: Option<String> = None;
+    // One entry per media file yt-dlp finishes moving into place — almost
+    // always one, but a playlist download prints this once per video, so we
+    // need all of them (not just the last) to know which `.description`
+    // sidecar files to tidy up below.
+    let mut all_paths: Vec<String> = Vec::new();
 
     // stream stderr into a buffer for a useful error message
     let err_app = app.clone();
@@ -711,7 +760,9 @@ async fn download(
             };
             let _ = app.emit("dl-progress", payload);
         } else if let Some(rest) = line.strip_prefix("FETCHFILE|") {
-            final_path = Some(rest.trim().to_string());
+            let p = rest.trim().to_string();
+            all_paths.push(p.clone());
+            final_path = Some(p);
         } else if line.contains("[Merger]") || line.contains("Merging formats") {
             let _ = app.emit(
                 "dl-progress",
@@ -751,6 +802,11 @@ async fn download(
     let err_text = stderr_handle.await.unwrap_or_default();
 
     if status.success() {
+        if req.write_description {
+            for p in &all_paths {
+                tidy_description_file(p);
+            }
+        }
         app.emit(
             "dl-done",
             DonePayload {
@@ -775,6 +831,30 @@ async fn download(
         )
         .ok();
         Err(message)
+    }
+}
+
+/// yt-dlp's `--write-description` saves the raw description text to a file
+/// literally named `<title>.description` — no extension a text/markdown
+/// viewer recognizes, so it opens as "unknown file type" until renamed by
+/// hand. `media_path` is the finished video/audio file sitting next to it
+/// (same folder, same stem); this reads that sidecar, wraps it as a small
+/// Markdown doc (title heading + body), writes it out as `<title>.md`, and
+/// removes the original. Best-effort: silently no-ops if the sidecar isn't
+/// there (e.g. yt-dlp couldn't find a description for this entry).
+fn tidy_description_file(media_path: &str) {
+    let media = Path::new(media_path);
+    let (Some(dir), Some(stem)) = (media.parent(), media.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let desc_path = dir.join(format!("{stem}.description"));
+    let Ok(body) = std::fs::read_to_string(&desc_path) else {
+        return;
+    };
+    let md_path = dir.join(format!("{stem}.md"));
+    let content = format!("# {stem}\n\n{}\n", body.trim_end());
+    if std::fs::write(&md_path, content).is_ok() {
+        let _ = std::fs::remove_file(&desc_path);
     }
 }
 
@@ -837,15 +917,20 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
 //   gyan.dev static build zip). Nothing touches the system PATH, the
 //   registry, or a package manager — install/uninstall is just files in one
 //   app-owned folder.
-// - macOS: still driven through Homebrew, which doesn't have the PATH/
-//   bloat problems winget had on Windows.
+// - macOS: yt-dlp is downloaded the same portable way, straight from its
+//   GitHub release (`yt-dlp_macos`, a universal x86_64+arm64 binary — no
+//   PATH/registry writes). ffmpeg has no official static macOS build (unlike
+//   Windows' gyan.dev), and the community ones are either Intel-only
+//   (evermeet.cx, needs Rosetta on Apple Silicon) or don't have stable
+//   scriptable URLs (osxexperts.net) — so ffmpeg still goes through
+//   Homebrew, which already solves that dependency problem properly.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Installers {
     /// An install path (package manager or direct download) is available.
     available: bool,
-    manager: String, // "brew" | "fetch" | ""
+    manager: String, // "mac" | "fetch" | ""
     platform: String,
 }
 
@@ -853,7 +938,10 @@ struct Installers {
 fn detect_installers() -> Installers {
     let platform = std::env::consts::OS.to_string();
     let (available, manager) = if cfg!(target_os = "macos") {
-        (resolve_binary("brew").is_some(), "brew")
+        // yt-dlp always downloads portably regardless of Homebrew; ffmpeg
+        // still needs brew, and that dependency surfaces its own error
+        // ("Homebrew isn't installed...") if it's missing when needed.
+        (true, "mac")
     } else if cfg!(target_os = "windows") {
         // Self-contained download — always available, no external tool needed.
         (true, "fetch")
@@ -873,13 +961,14 @@ async fn install_tools(app: AppHandle, tools: Vec<String>) -> Result<(), String>
         return Ok(());
     }
 
-    let result = if cfg!(target_os = "macos") {
-        install_tools_brew(&app, &tools).await
-    } else if cfg!(target_os = "windows") {
-        install_tools_portable(&app, &tools).await
-    } else {
-        Err("Automatic install is only supported on macOS and Windows. Install yt-dlp and ffmpeg with your package manager.".to_string())
-    };
+    #[cfg(target_os = "macos")]
+    let result = install_tools_macos(&app, &tools).await;
+
+    #[cfg(windows)]
+    let result = install_tools_portable(&app, &tools).await;
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let result: Result<(), String> = Err("Automatic install is only supported on macOS and Windows. Install yt-dlp and ffmpeg with your package manager.".to_string());
 
     if let Err(msg) = &result {
         app.emit("install-error", msg.clone()).ok();
@@ -890,9 +979,17 @@ async fn install_tools(app: AppHandle, tools: Vec<String>) -> Result<(), String>
 }
 
 async fn install_tools_brew(app: &AppHandle, tools: &[String]) -> Result<(), String> {
+    brew_cmd(app, "install", tools).await
+}
+
+async fn upgrade_tools_brew(app: &AppHandle, tools: &[String]) -> Result<(), String> {
+    brew_cmd(app, "upgrade", tools).await
+}
+
+async fn brew_cmd(app: &AppHandle, subcommand: &str, tools: &[String]) -> Result<(), String> {
     let brew = resolve_binary("brew")
         .ok_or("Homebrew isn't installed. Get it from https://brew.sh, then reopen FETCH.")?;
-    let mut args = vec!["install".to_string()];
+    let mut args = vec![subcommand.to_string()];
     args.extend(tools.iter().cloned());
 
     app.emit(
@@ -901,13 +998,22 @@ async fn install_tools_brew(app: &AppHandle, tools: &[String]) -> Result<(), Str
     )
     .ok();
 
-    let mut child = Command::new(&brew)
-        .args(&args)
+    let mut cmd = Command::new(&brew);
+    cmd.args(&args)
         .env("PATH", augmented_path())
         // brew refuses to run if it thinks it's non-interactive in odd ways;
         // NONINTERACTIVE makes it proceed without prompting.
-        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
-        .env("NONINTERACTIVE", "1")
+        .env("NONINTERACTIVE", "1");
+    // Skipping brew's auto-update is fine (and faster) for a first-time
+    // install, but `upgrade` needs a fresh formula index to even know a
+    // newer version exists — with auto-update disabled, `brew upgrade` on a
+    // stale tap silently no-ops (exits 0, nothing changes), so our own
+    // version check against gyan.dev keeps reporting the same update
+    // available forever.
+    if subcommand != "upgrade" {
+        cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1");
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -939,6 +1045,68 @@ async fn install_tools_brew(app: &AppHandle, tools: &[String]) -> Result<(), Str
     Ok(())
 }
 
+/// Downloads `url` to `dest` via the system `curl` (ships with macOS),
+/// writing to a `.part` file first so a failed download never leaves a
+/// half-written binary behind.
+#[cfg(target_os = "macos")]
+async fn mac_curl_download(url: &str, dest: &Path) -> Result<(), String> {
+    let curl = resolve_binary("curl").ok_or("curl not found. It ships with macOS — check it hasn't been removed.")?;
+    let tmp = dest.with_extension("part");
+    let status = Command::new(&curl)
+        // --connect-timeout bounds the initial connection; --speed-time/
+        // --speed-limit aborts a connection that stalls mid-transfer —
+        // without these a dropped/blocked connection can hang indefinitely.
+        .args(["-L", "-sS", "--fail", "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000", "-o"])
+        .arg(&tmp)
+        .arg(url)
+        .status()
+        .await
+        .map_err(|e| format!("Failed to launch curl: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Download failed: {url}"));
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| format!("Couldn't save {}: {e}", dest.display()))
+}
+
+/// yt-dlp downloads portably (its GitHub release ships a universal
+/// x86_64+arm64 macOS binary, so there's no arch-detection needed). Any
+/// other requested tool (i.e. ffmpeg) still goes through Homebrew.
+#[cfg(target_os = "macos")]
+async fn install_tools_macos(app: &AppHandle, tools: &[String]) -> Result<(), String> {
+    let mut brew_tools: Vec<String> = Vec::new();
+
+    for tool in tools {
+        if tool == "yt-dlp" {
+            let bin_dir = portable_bin_dir();
+            std::fs::create_dir_all(&bin_dir)
+                .map_err(|e| format!("Couldn't create {}: {e}", bin_dir.display()))?;
+            let dest = bin_dir.join("yt-dlp");
+
+            app.emit("install-log", "Downloading yt-dlp (portable, universal binary)…").ok();
+            mac_curl_download(
+                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
+                &dest,
+            )
+            .await?;
+
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
+
+            app.emit("install-log", format!("Saved to {}", dest.display())).ok();
+        } else {
+            brew_tools.push(tool.clone());
+        }
+    }
+
+    if !brew_tools.is_empty() {
+        install_tools_brew(app, &brew_tools).await?;
+    }
+    Ok(())
+}
+
 /// Windows' own System32 copy of a tool, bypassing PATH entirely. Some
 /// machines have a different `curl`/`tar` earlier on PATH (e.g. Git for
 /// Windows' GNU tar, which — unlike the bsdtar in System32 — can't read
@@ -954,13 +1122,14 @@ fn system32_bin(name: &str) -> Option<PathBuf> {
 
 /// Downloads `url` to `dest` via curl, writing to a `.part` file first so a
 /// failed download never leaves a half-written binary behind.
+#[cfg(windows)]
 async fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
     let curl = system32_bin("curl")
         .or_else(|| resolve_binary("curl"))
         .ok_or("curl.exe not found. It ships with Windows 10/11 — check it hasn't been removed.")?;
     let tmp = dest.with_extension("part");
     let status = Command::new(&curl)
-        .args(["-L", "-sS", "--fail", "-o"])
+        .args(["-L", "-sS", "--fail", "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000", "-o"])
         .arg(&tmp)
         .arg(url)
         .status()
@@ -976,6 +1145,7 @@ async fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
 /// Recursively finds a file named `name` under `dir` (used to pull
 /// ffmpeg.exe/ffprobe.exe out of the zip's versioned `…/bin/` subfolder
 /// without having to know its exact name).
+#[cfg(windows)]
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -990,6 +1160,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(windows)]
 async fn install_tools_portable(app: &AppHandle, tools: &[String]) -> Result<(), String> {
     let bin_dir = portable_bin_dir();
     std::fs::create_dir_all(&bin_dir)
@@ -1061,10 +1232,199 @@ async fn install_tools_portable(app: &AppHandle, tools: &[String]) -> Result<(),
     Ok(())
 }
 
-/// Relaunches FETCH. Not needed for the portable Windows install path
-/// (binaries live in `portable_bin_dir()`, which is always searched first —
-/// no restart required), but kept as a fallback for edge cases like the
-/// Homebrew path on macOS.
+// ── update checking ──────────────────────────────────────────────────────
+// Best-effort and read-only by default: `check_for_updates` never fails the
+// whole call just because one lookup (or the network) is unavailable — a
+// tool's `current`/`latest` just stay `None` and `updateAvailable` false.
+// yt-dlp especially needs this: it ships new releases every 1-2 weeks to
+// keep up with YouTube's changes, and a stale copy silently breaks.
+
+#[derive(Serialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ToolUpdate {
+    current: Option<String>,
+    latest: Option<String>,
+    update_available: bool,
+    source: String, // "portable" | "brew" | "other" | ""
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    yt_dlp: ToolUpdate,
+    ffmpeg: ToolUpdate,
+}
+
+/// Where a resolved binary came from, so `update_tool` knows how to update
+/// it: our own portable copy can just be re-downloaded in place, a Homebrew
+/// one gets `brew upgrade`, anything else (system pip, apt, a manual copy on
+/// PATH) we don't touch.
+fn tool_source(path: &Path) -> &'static str {
+    if path.starts_with(portable_bin_dir()) {
+        "portable"
+    } else if path.starts_with("/opt/homebrew")
+        || path.starts_with("/usr/local/Cellar")
+        || path.starts_with("/usr/local/bin")
+        || path.starts_with("/opt/local")
+    {
+        "brew"
+    } else {
+        "other"
+    }
+}
+
+/// GET `url` via the system `curl` and return the response body as text.
+async fn curl_get(url: &str) -> Result<String, String> {
+    let curl = resolve_binary("curl").ok_or("curl not found.")?;
+    let output = Command::new(&curl)
+        .args(["-L", "-sS", "--fail", "--connect-timeout", "10", "--max-time", "15", "-H", "User-Agent: fetch-app"])
+        .arg(url)
+        .env("PATH", augmented_path())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to launch curl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Request failed: {url}"));
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+async fn latest_ytdlp_version() -> Result<String, String> {
+    let body = curl_get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest").await?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Unexpected response from GitHub".to_string())
+}
+
+/// gyan.dev (the same source Windows' portable ffmpeg comes from) publishes
+/// this as a plain-text file with just the version, e.g. "8.1.2" — it tracks
+/// upstream FFmpeg's actual release version, so it's a fine stand-in for
+/// "latest" on macOS too even though that build itself is Windows-only.
+async fn latest_ffmpeg_version() -> Result<String, String> {
+    let body = curl_get("https://www.gyan.dev/ffmpeg/builds/release-version").await?;
+    let v = body.trim().to_string();
+    if v.is_empty() {
+        Err("Empty response".to_string())
+    } else {
+        Ok(v)
+    }
+}
+
+async fn binary_version_output(path: &Path, arg: &str) -> Option<String> {
+    let out = Command::new(path).arg(arg).output().await.ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !stdout.trim().is_empty() {
+        Some(stdout.into_owned())
+    } else {
+        Some(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// Pulls the first digit-dot run out of a string, e.g.
+/// "ffmpeg version 8.1.2 Copyright..." -> "8.1.2".
+fn parse_leading_version(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let tok = s[start..i].trim_end_matches('.');
+            if tok.contains('.') {
+                return Some(tok.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Just the locally-installed version + source of each tool — no network
+/// calls, so it resolves near-instantly. Kept separate from
+/// `check_for_updates` so the frontend can show "current version" right
+/// away instead of it being stuck blank behind a slow/blocked network
+/// lookup of the *latest* version.
+#[tauri::command]
+async fn installed_versions() -> UpdateCheck {
+    let mut out = UpdateCheck::default();
+    if let Some(path) = resolve_binary("yt-dlp") {
+        out.yt_dlp.source = tool_source(&path).to_string();
+        out.yt_dlp.current = binary_version_output(&path, "--version")
+            .await
+            .map(|s| s.trim().to_string());
+    }
+    if let Some(path) = resolve_binary("ffmpeg") {
+        out.ffmpeg.source = tool_source(&path).to_string();
+        out.ffmpeg.current = binary_version_output(&path, "-version")
+            .await
+            .and_then(|s| parse_leading_version(&s));
+    }
+    out
+}
+
+#[tauri::command]
+async fn check_for_updates() -> UpdateCheck {
+    let mut out = installed_versions().await;
+
+    if !out.yt_dlp.source.is_empty() {
+        if let Ok(latest) = latest_ytdlp_version().await {
+            out.yt_dlp.update_available = out.yt_dlp.current.as_deref() != Some(latest.as_str());
+            out.yt_dlp.latest = Some(latest);
+        }
+    }
+
+    if !out.ffmpeg.source.is_empty() {
+        if let Ok(latest) = latest_ffmpeg_version().await {
+            out.ffmpeg.update_available = out.ffmpeg.current.as_deref().map(|c| c != latest).unwrap_or(false);
+            out.ffmpeg.latest = Some(latest);
+        }
+    }
+
+    out
+}
+
+/// Updates a single tool in place, using whatever installed it (mirrors
+/// `install_tools`'s events: `install-log`/`install-done`/`install-error`,
+/// so the frontend can reuse the same progress plumbing).
+#[tauri::command]
+async fn update_tool(app: AppHandle, tool: String) -> Result<(), String> {
+    let path = resolve_binary(&tool).ok_or_else(|| format!("{tool} not found."))?;
+    let source = tool_source(&path);
+
+    let result: Result<(), String> = match source {
+        "portable" => {
+            #[cfg(target_os = "macos")]
+            {
+                install_tools_macos(&app, std::slice::from_ref(&tool)).await
+            }
+            #[cfg(windows)]
+            {
+                install_tools_portable(&app, std::slice::from_ref(&tool)).await
+            }
+            #[cfg(all(not(target_os = "macos"), not(windows)))]
+            {
+                Err("Portable updates aren't supported on this platform.".to_string())
+            }
+        }
+        "brew" => upgrade_tools_brew(&app, std::slice::from_ref(&tool)).await,
+        _ => Err(format!("{tool} wasn't installed by FETCH or Homebrew — update it manually.")),
+    };
+
+    if let Err(msg) = &result {
+        app.emit("install-error", msg.clone()).ok();
+        return result;
+    }
+    app.emit("install-done", ()).ok();
+    Ok(())
+}
+
+/// Relaunches FETCH. Not needed for portable installs (binaries land in
+/// `portable_bin_dir()`, which is always searched first — no restart
+/// required), but kept as a fallback for the Homebrew path on macOS (ffmpeg).
 #[tauri::command]
 fn restart_app(app: AppHandle) {
     app.restart();
@@ -1080,11 +1440,15 @@ pub fn run() {
             check_binaries,
             default_download_dir,
             analyze,
+            cancel_analyze,
             download,
             cancel_download,
             reveal_in_folder,
             detect_installers,
             install_tools,
+            installed_versions,
+            check_for_updates,
+            update_tool,
             restart_app
         ])
         .run(tauri::generate_context!())

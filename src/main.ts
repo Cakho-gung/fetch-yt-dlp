@@ -12,8 +12,18 @@ interface Binaries {
 }
 interface Installers {
   available: boolean;
-  manager: string; // "brew" | "winget" | ""
+  manager: string; // "mac" | "fetch" | ""
   platform: string;
+}
+interface ToolUpdate {
+  current?: string;
+  latest?: string;
+  updateAvailable: boolean;
+  source: string; // "portable" | "brew" | "other" | ""
+}
+interface UpdateCheck {
+  ytDlp: ToolUpdate;
+  ffmpeg: ToolUpdate;
 }
 interface QualityOption {
   id: string;
@@ -58,7 +68,6 @@ type Screen =
   | "playlist"
   | "mix"
   | "downloading"
-  | "error"
   | "installing";
 
 // ── app state ──────────────────────────────────────────────────────────────
@@ -69,15 +78,26 @@ const state = {
   installLog: [] as string[],
   installDone: false,
   installError: "",
+  // What the "installing" screen is currently showing: the label(s) to
+  // display, whether it's a version update (vs. first-time install of a
+  // missing tool — different title/copy, and doesn't force a restart), and
+  // which screen to return to once it's done (updates happen mid-session,
+  // so unlike a first-time install we can't just dump the user back to
+  // "empty" — they may have a link/analysis in progress).
+  installTargets: [] as string[],
+  installIsUpdate: false,
+  installReturnScreen: null as Screen | null,
+  updateCheck: null as UpdateCheck | null,
+  checkingUpdates: false,
   outputDir: "",
   url: "",
+  analyzingId: null as string | null,
   analysis: null as AnalyzeResult | null,
   tab: "video" as "video" | "audio",
   selectedQualityId: "",
   writeThumbnail: false,
   writeDescription: false,
   writeSubs: false,
-  errorMsg: "",
   job: null as null | {
     id: string;
     percent: number;
@@ -163,6 +183,11 @@ let lastAnimScreen: Screen | null = null;
 function render() {
   updateStatusTag();
   const el = body();
+  // The playlist entry list re-renders from scratch on every small
+  // interaction (ticking a row, select-all, switching tab/quality) since
+  // it's all one innerHTML swap — save + restore its scroll position across
+  // that so ticking a checkbox doesn't jump the list back to the top.
+  const listScroll = el.querySelector<HTMLElement>(".playlist-rows")?.scrollTop;
   switch (state.screen) {
     case "empty":
     case "analyzing":
@@ -180,15 +205,16 @@ function render() {
     case "downloading":
       el.innerHTML = viewDownloading();
       break;
-    case "error":
-      el.innerHTML = viewError();
-      break;
     case "installing":
       el.innerHTML = viewInstalling();
       break;
   }
   wireEvents();
   renderSettingsModal();
+  if (listScroll) {
+    const list = el.querySelector<HTMLElement>(".playlist-rows");
+    if (list) list.scrollTop = listScroll;
+  }
   // replay the entrance animation only on an actual screen change — toggling
   // the class forces a reflow so it retriggers even though #body itself never
   // leaves the DOM. In-place updates within the same screen (tab switch,
@@ -228,17 +254,33 @@ function missingBinariesWarn(): string {
   if (need.length === 0) return "";
   const canAuto = !!state.installers?.available;
   const mgr = state.installers?.manager || "brew";
-  const isBrew = mgr === "brew";
+  const needsYtDlp = need.includes("yt-dlp");
+  const needsFfmpeg = need.includes("ffmpeg");
+
+  let label = "⇣ INSTALL WITH BREW";
+  let desc = `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`;
+  if (mgr === "fetch") {
+    label = "⇣ DOWNLOAD YT-DLP + FFMPEG";
+    desc = `FETCH downloads portable copies into its own folder — no system install, no PATH changes. ffmpeg can take a few minutes.`;
+  } else if (mgr === "mac") {
+    // yt-dlp downloads straight into FETCH's own folder; ffmpeg still goes
+    // through brew (no reliable portable static build for macOS).
+    if (needsYtDlp && needsFfmpeg) {
+      label = "⇣ DOWNLOAD YT-DLP + INSTALL FFMPEG";
+      desc = `yt-dlp downloads directly, no install needed; ffmpeg installs via <code>brew</code> — can take a few minutes.`;
+    } else if (needsYtDlp) {
+      label = "⇣ DOWNLOAD YT-DLP";
+      desc = `FETCH downloads a portable copy into its own folder — no system install, no PATH changes.`;
+    } else {
+      label = "⇣ INSTALL WITH BREW";
+      desc = `FETCH will run <code>brew</code> for you to install ffmpeg — can take a few minutes.`;
+    }
+  }
+
   const actions = canAuto
     ? `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
-         <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${
-           isBrew ? `⇣ INSTALL WITH BREW` : `⇣ DOWNLOAD YT-DLP + FFMPEG`
-         }</button>
-         <span class="text-muted" style="font-size:11.5px">${
-           isBrew
-             ? `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`
-             : `FETCH downloads portable copies into its own folder — no system install, no PATH changes. ffmpeg can take a few minutes.`
-         }</span>
+         <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${label}</button>
+         <span class="text-muted" style="font-size:11.5px">${desc}</span>
        </div>`
     : `<br>macOS: <code>brew install ${need.join(" ")}</code>, then reopen FETCH. On other platforms, install ${need.join(
         " and "
@@ -250,17 +292,24 @@ function missingBinariesWarn(): string {
 }
 
 function viewInstalling(): string {
-  const need = missingTools();
+  const stillMissing = missingTools();
+  const targets = state.installTargets.length ? state.installTargets : stillMissing;
   const logLines = state.installLog.slice(-200).map(esc).join("\n");
   const done = state.installDone;
   const errored = !!state.installError;
-  const needsRestart = done && need.length > 0;
+  // Version updates re-resolve the binary on the very next command (no
+  // caching to invalidate), so — unlike a first-time install — they never
+  // need a restart.
+  const needsRestart = done && !state.installIsUpdate && stillMissing.length > 0;
+  const verb = state.installIsUpdate ? "UPDATING" : "INSTALLING";
+  const doneLabel = state.installIsUpdate ? "UPDATED ✓" : "INSTALLED ✓";
+  const failLabel = state.installIsUpdate ? "UPDATE FAILED" : "INSTALL FAILED";
   return `
   <div class="blueprint job" style="border-color:var(--color-accent)">${corners}
     <div class="job-top">
       <div class="job-info">
         <span class="job-name">${
-          errored ? "INSTALL FAILED" : done ? "INSTALLED ✓" : `INSTALLING ${need.join(" + ").toUpperCase()}…`
+          errored ? failLabel : done ? doneLabel : `${verb} ${targets.join(" + ").toUpperCase()}…`
         }</span>
         <span class="job-stage text-muted">${
           errored
@@ -268,8 +317,8 @@ function viewInstalling(): string {
             : needsRestart
             ? "FETCH needs to restart to pick this up"
             : done
-            ? "tools are ready"
-            : state.installers?.manager === "brew"
+            ? (state.installIsUpdate ? "up to date" : "tools are ready")
+            : state.installers?.manager !== "fetch" && targets.includes("ffmpeg")
             ? "running brew — please wait"
             : "downloading — please wait"
         }</span>
@@ -354,12 +403,49 @@ function renderSettingsModal() {
             }
           </div>
         </div>
+        <div class="settings-group">
+          <span class="section-label">TOOLS</span>
+          ${toolUpdateRow("yt-dlp", state.updateCheck?.ytDlp)}
+          ${toolUpdateRow("ffmpeg", state.updateCheck?.ffmpeg)}
+          <div class="dir-row" style="margin-top:var(--space-2)">
+            <button class="btn btn-ghost" id="checkUpdatesBtn" ${state.checkingUpdates ? "disabled" : ""}>
+              ${state.checkingUpdates ? "CHECKING…" : "⟳ CHECK FOR UPDATES"}
+            </button>
+          </div>
+        </div>
       </div>
       <div class="modal-foot">
         <button class="btn btn-primary" id="settingsDone">DONE</button>
       </div>
     </div>`;
   wireSettingsEvents();
+}
+
+function toolUpdateRow(tool: "yt-dlp" | "ffmpeg", info: ToolUpdate | undefined): string {
+  const label = tool === "yt-dlp" ? "yt-dlp" : "ffmpeg";
+  const current = info?.current ? esc(info.current) : "—";
+  let status: string;
+  if (!info) {
+    status = "";
+  } else if (info.updateAvailable) {
+    status = `<span class="tag tag-accent">${esc(info.latest || "?")} available</span>`;
+  } else if (info.latest) {
+    status = `<span class="text-muted" style="font-size:11.5px">up to date</span>`;
+  } else {
+    status = `<span class="text-muted" style="font-size:11.5px">couldn't check</span>`;
+  }
+  const canUpdate = !!info?.updateAvailable && (info.source === "portable" || info.source === "brew");
+  return `<div class="dir-row" style="justify-content:space-between">
+    <span style="display:flex;align-items:center;gap:var(--space-2)">
+      <span class="mono" style="font-size:12.5px">${label} ${current}</span>
+      ${status}
+    </span>
+    ${
+      canUpdate
+        ? `<button class="btn btn-ghost settings-update-btn" data-tool="${esc(tool)}" style="font-size:11.5px">UPDATE</button>`
+        : ""
+    }
+  </div>`;
 }
 
 function wireSettingsEvents() {
@@ -383,6 +469,20 @@ function wireSettingsEvents() {
         renderSettingsModal();
       })
     );
+  document.getElementById("checkUpdatesBtn")?.addEventListener("click", async () => {
+    state.checkingUpdates = true;
+    renderSettingsModal();
+    await checkForUpdates({ toast: false });
+    state.checkingUpdates = false;
+    renderSettingsModal();
+  });
+  document.querySelectorAll<HTMLButtonElement>(".settings-update-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const tool = btn.dataset.tool!;
+      closeSettings();
+      startToolUpdate(tool);
+    })
+  );
 }
 
 function openSettings() {
@@ -393,6 +493,7 @@ function openSettings() {
   overlay.classList.remove("hidden");
   renderSettingsModal();
   requestAnimationFrame(() => overlay.classList.add("open"));
+  loadInstalledVersions();
 }
 let settingsHideTimer: number | undefined;
 function closeSettings() {
@@ -468,10 +569,29 @@ function relTime(at: number): string {
 }
 
 // input row (live) — used in empty & success
+// Always the live, editable URL box — never swapped for a read-only chip or
+// disabled once something's been analyzed. Submitting again (Enter or the
+// button) just cancels whatever analyze is in flight and starts a new one;
+// see doAnalyze(). Only the trailing status tag changes per screen.
 function linkInputRow(placeholder: string): string {
   const canAnalyze = !!(state.binaries?.ytDlp && state.binaries?.ffmpeg);
+  const a = state.analysis;
+  let statusTag = "";
+  if (a && state.screen === "playlist") {
+    const count = a.playlistCount ?? a.entries.length;
+    statusTag = `<span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>`;
+  } else if (a && state.screen === "mix") {
+    statusTag = `<span class="tag tag-neutral" style="font-weight:700">MIX · ENDLESS</span>`;
+  } else if (a && state.screen === "analyzed") {
+    const src = detectSource(a.webpageUrl);
+    statusTag = `<span class="tag tag-accent">${esc(a.extractor.toUpperCase() || src)}</span>`;
+  }
   return `<div class="link-row">
-    <input class="input" id="urlInput" placeholder="${esc(placeholder)}" value="${esc(state.url)}" spellcheck="false" autocomplete="off" ${canAnalyze ? "" : "disabled"}>
+    <div class="link-input-wrap">
+      <input class="input" id="urlInput" placeholder="${esc(placeholder)}" value="${esc(state.url)}" spellcheck="false" autocomplete="off" ${canAnalyze ? "" : "disabled"}>
+      ${state.url ? `<span class="icon-x link-clear" id="clearLink" title="Clear">✕</span>` : ""}
+    </div>
+    ${statusTag}
     <button class="btn btn-primary" id="analyzeBtn" ${isLikelyUrl(state.url) && canAnalyze ? "" : "disabled"}>ANALYZE</button>
   </div>`;
 }
@@ -519,17 +639,8 @@ function viewAnalyzed(): string {
     state.selectedQualityId = opts.find((o) => o.id === "1080p")?.id ?? opts[0].id;
   }
   const selected = opts.find((o) => o.id === state.selectedQualityId) ?? opts[0];
-  const src = detectSource(a.webpageUrl);
   return `
-  <div class="link-row">
-    <div class="link-chip">
-      <span style="color:var(--color-accent-700);font-size:12px">✓</span>
-      <span class="url">${esc(a.webpageUrl)}</span>
-      <span class="tag tag-accent">${esc(a.extractor.toUpperCase() || src)}</span>
-      <span class="icon-x" id="clearLink">✕</span>
-    </div>
-    <button class="btn btn-secondary" style="min-height:42px;padding-inline:var(--space-4);color:var(--color-accent-700)">✓ ANALYZED</button>
-  </div>
+  ${linkInputRow("Paste a video, music or playlist link…")}
   <div class="grid-analyze">
     <figure class="blueprint preview">${corners}
       <div class="thumb">
@@ -605,14 +716,7 @@ function viewPlaylist(): string {
     })
     .join("");
   return `
-  <div class="link-row">
-    <div class="link-chip">
-      <span style="color:var(--color-accent-700);font-size:12px">✓</span>
-      <span class="url">${esc(a.webpageUrl)}</span>
-      <span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>
-      <span class="icon-x" id="clearLink">✕</span>
-    </div>
-  </div>
+  ${linkInputRow("Paste a video, music or playlist link…")}
   <div class="grid-analyze">
     <div class="blueprint preview playlist-box">${corners}
       <div class="playlist-head">
@@ -656,13 +760,8 @@ function viewPlaylist(): string {
 }
 
 function viewMix(): string {
-  const a = state.analysis!;
   return `
-  <div class="link-chip" style="border-color:var(--color-neutral-700);flex:none">
-    <span style="font-size:13px;color:var(--color-neutral-700)">∞</span>
-    <span class="url">${esc(a.webpageUrl)}</span>
-    <span class="tag tag-neutral" style="font-weight:700">MIX · ENDLESS</span>
-  </div>
+  ${linkInputRow("Paste a video, music or playlist link…")}
   <div class="card" style="gap:var(--space-3);padding:var(--space-4)">
     <div>
       <h4 style="margin-bottom:var(--space-1);font-size:17px">THIS IS A MIX — AN AUTO-GENERATED LIST WITH NO END</h4>
@@ -724,20 +823,6 @@ function viewDownloading(): string {
   </div>`;
 }
 
-function viewError(): string {
-  return `
-  <div class="banner error">
-    <span class="ok">!</span>
-    <div class="b-txt">
-      <span class="b-ttl">COULDN'T DO THAT</span>
-      <span class="b-sub" style="white-space:normal">${esc(state.errorMsg)}</span>
-    </div>
-    <button class="btn btn-secondary" id="backBtn" style="flex:none">BACK</button>
-  </div>
-  ${linkInputRow("Paste a link to try again…")}
-  ${historyStrip()}`;
-}
-
 // ── event wiring (re-run after every render) ─────────────────────────────
 function wireEvents() {
   $("#urlInput")?.addEventListener("input", (e) => {
@@ -750,12 +835,11 @@ function wireEvents() {
   });
   $("#analyzeBtn")?.addEventListener("click", doAnalyze);
   $("#clearLink")?.addEventListener("click", resetToEmpty);
-  $("#backBtn")?.addEventListener("click", resetToEmpty);
   $("#pickDir")?.addEventListener("click", pickDir);
   $("#downloadBtn")?.addEventListener("click", startDownload);
   $("#cancelBtn")?.addEventListener("click", cancelDownload);
   $("#installBtn")?.addEventListener("click", startInstall);
-  $("#installBack")?.addEventListener("click", finishInstall);
+  $("#installBack")?.addEventListener("click", () => (state.installIsUpdate ? finishToolUpdate() : finishInstall()));
   $("#installRestart")?.addEventListener("click", restartApp);
 
   // format tabs (video/audio)
@@ -838,7 +922,18 @@ function wireEvents() {
 }
 
 // ── actions ──────────────────────────────────────────────────────────────
+// Kills whatever analyze is currently running on the backend, if any — used
+// whenever the link changes or the user backs out, so a stale request can
+// never land and clobber what's on screen.
+function cancelInFlightAnalyze() {
+  if (state.analyzingId) {
+    invoke("cancel_analyze", { id: state.analyzingId }).catch(() => {});
+    state.analyzingId = null;
+  }
+}
+
 function resetToEmpty() {
+  cancelInFlightAnalyze();
   state.screen = "empty";
   state.url = "";
   state.analysis = null;
@@ -847,14 +942,35 @@ function resetToEmpty() {
   render();
 }
 
-// ── "done" toast — floats above whatever screen is current; opening/closing
-// only ever touches #toastWrap, never #body, so it never disrupts the user's
-// next action underneath it. Slides up from the bottom edge, auto-dismisses
-// after 5s (paused while the pointer is over it so it doesn't vanish mid-read).
+// Same as resetToEmpty() but keeps the URL in the input — used after a
+// failed analyze/download so the user can just hit ANALYZE again instead of
+// retyping the link they already pasted.
+function backToEmptyKeepingUrl() {
+  cancelInFlightAnalyze();
+  state.screen = "empty";
+  state.analysis = null;
+  state.selectedQualityId = "";
+  state.tab = "video";
+  render();
+}
+
+// ── toasts — float above whatever screen is current; opening/closing only
+// ever touches #toastWrap, never #body, so they never disrupt the user's
+// next action underneath. Slide up from the bottom edge.
+// "done"/"error" toasts auto-dismiss after 5s (paused while the pointer is
+// over them). "update" toasts don't — they're only ever closed by the user
+// or by the update actually being applied.
 const TOAST_DURATION = 5000;
 const TOAST_TRANSITION = 220; // must match .toast-wrap .toast's transition duration in styles.css
 let toastAutoTimer: number | undefined;
 let toastCleanupTimer: number | undefined;
+// Tracked so the shared #toastWrap knows which behavior applies to what's
+// on screen right now (mouse-leave re-arming, and what to do once
+// dismissToast runs).
+let activeToastKind: "done" | "update" | "error" | null = null;
+// Set only by the user clicking the update toast's own ✕. Session-scoped —
+// resets on relaunch, so the next startup check surfaces it again either way.
+let updateToastDismissedManually = false;
 
 function armToastTimer() {
   window.clearTimeout(toastAutoTimer);
@@ -865,6 +981,7 @@ function showDoneToast(item: HistoryItem) {
   const wrap = document.getElementById("toastWrap");
   if (!wrap) return;
   window.clearTimeout(toastCleanupTimer);
+  activeToastKind = "done";
   wrap.classList.remove("hidden");
   wrap.innerHTML = `
     <div class="banner toast">
@@ -883,20 +1000,142 @@ function showDoneToast(item: HistoryItem) {
   requestAnimationFrame(() => wrap.classList.add("open"));
   armToastTimer();
 }
+
+function showErrorToast(message: string) {
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap) return;
+  window.clearTimeout(toastCleanupTimer);
+  activeToastKind = "error";
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = `
+    <div class="banner toast error">
+      <span class="ok">!</span>
+      <div class="b-txt">
+        <span class="b-ttl">COULDN'T DO THAT</span>
+        <span class="b-sub" style="white-space:normal">${esc(message)}</span>
+      </div>
+      <span class="icon-x" id="toastClose">✕</span>
+    </div>`;
+  document.getElementById("toastClose")?.addEventListener("click", dismissToast);
+  requestAnimationFrame(() => wrap.classList.add("open"));
+  armToastTimer();
+}
+
 function dismissToast() {
   window.clearTimeout(toastAutoTimer);
   const wrap = document.getElementById("toastWrap");
   if (!wrap) return;
+  const wasUpdate = activeToastKind === "update";
   wrap.classList.remove("open");
   toastCleanupTimer = window.setTimeout(() => {
     wrap.classList.add("hidden");
     wrap.innerHTML = "";
+    activeToastKind = null;
+    if (wasUpdate) {
+      // Only reachable via the toast's own ✕ (it never auto-dismisses).
+      updateToastDismissedManually = true;
+    } else {
+      // A "done" toast just finished its course — if an update notice was
+      // waiting behind it, bring it back instead of losing it silently.
+      maybeResurfaceUpdateToast();
+    }
   }, TOAST_TRANSITION);
+}
+
+// ── update checking ─────────────────────────────────────────────────────
+// yt-dlp ships new releases every 1-2 weeks to keep up with YouTube's
+// changes, so a stale copy silently breaks — this pings once at startup
+// (and on demand from Settings) and surfaces a toast that stays up until
+// the user closes it or applies the update, never a blocking screen.
+function pendingUpdateItems(): { tool: string; label: string; from?: string; to?: string }[] {
+  const result = state.updateCheck;
+  if (!result) return [];
+  const items: { tool: string; label: string; from?: string; to?: string }[] = [];
+  if (result.ytDlp.updateAvailable) {
+    items.push({ tool: "yt-dlp", label: "yt-dlp", from: result.ytDlp.current, to: result.ytDlp.latest });
+  }
+  if (result.ffmpeg.updateAvailable) {
+    items.push({ tool: "ffmpeg", label: "ffmpeg", from: result.ffmpeg.current, to: result.ffmpeg.latest });
+  }
+  return items;
+}
+
+function maybeResurfaceUpdateToast() {
+  if (updateToastDismissedManually) return;
+  const items = pendingUpdateItems();
+  if (items.length) showUpdateToast(items);
+}
+
+async function checkForUpdates(opts: { toast: boolean } = { toast: true }) {
+  try {
+    state.updateCheck = await invoke<UpdateCheck>("check_for_updates");
+    if (!opts.toast) return;
+    const items = pendingUpdateItems();
+    // Don't steal the slot from an in-progress download-completion toast —
+    // it'll resurface on its own once that one clears.
+    if (items.length && activeToastKind !== "done") showUpdateToast(items);
+  } catch {}
+}
+
+// Local-only (no network) version lookup — resolves near-instantly, unlike
+// checkForUpdates() which also has to reach GitHub/gyan.dev for the latest
+// version and can take a while (or hang) on a slow/blocked connection.
+// Called whenever Settings opens so "current version" never sits blank
+// behind that network round-trip.
+async function loadInstalledVersions() {
+  try {
+    const local = await invoke<UpdateCheck>("installed_versions");
+    state.updateCheck = state.updateCheck
+      ? {
+          ytDlp: { ...state.updateCheck.ytDlp, current: local.ytDlp.current, source: local.ytDlp.source },
+          ffmpeg: { ...state.updateCheck.ffmpeg, current: local.ffmpeg.current, source: local.ffmpeg.source },
+        }
+      : local;
+    if (state.settingsOpen) renderSettingsModal();
+  } catch {}
+}
+
+function showUpdateToast(items: { tool: string; label: string; from?: string; to?: string }[]) {
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap || !items.length) return;
+  window.clearTimeout(toastCleanupTimer);
+  window.clearTimeout(toastAutoTimer); // stays up until dismissed or updated — no auto-hide
+  activeToastKind = "update";
+  wrap.classList.remove("hidden");
+  const rows = items
+    .map(
+      (it) => `<div class="update-row" data-row-tool="${esc(it.tool)}" style="display:contents">
+        <div class="b-txt">
+          <span class="b-ttl">${esc(it.label.toUpperCase())} UPDATE AVAILABLE</span>
+          <span class="b-sub">${esc(it.from || "?")} → ${esc(it.to || "?")}</span>
+        </div>
+        <button class="btn btn-primary update-tool-btn" data-tool="${esc(it.tool)}" style="flex:none">UPDATE</button>
+      </div>`
+    )
+    .join("");
+  wrap.innerHTML = `
+    <div class="banner toast" id="updateToast">
+      <span class="ok">⇪</span>
+      ${rows}
+      <span class="icon-x" id="updateToastClose">✕</span>
+    </div>`;
+  wrap.querySelectorAll<HTMLButtonElement>(".update-tool-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const tool = btn.dataset.tool!;
+      dismissToast();
+      startToolUpdate(tool);
+    })
+  );
+  document.getElementById("updateToastClose")?.addEventListener("click", dismissToast);
+  requestAnimationFrame(() => wrap.classList.add("open"));
 }
 
 function startInstall() {
   const need = missingTools();
   if (!need.length) return;
+  state.installTargets = need;
+  state.installIsUpdate = false;
+  state.installReturnScreen = null;
   state.installLog = [];
   state.installDone = false;
   state.installError = "";
@@ -916,6 +1155,40 @@ async function finishInstall() {
     state.binaries = await invoke<Binaries>("check_binaries");
   } catch {}
   resetToEmpty();
+}
+
+// Same screen/log/progress UI as a first-time install, but for updating a
+// tool that's already working — triggered from the Settings modal or the
+// update toast. Unlike startInstall() this can happen mid-session, so it
+// remembers the current screen and returns to it instead of resetting.
+function startToolUpdate(tool: string) {
+  state.installTargets = [tool];
+  state.installIsUpdate = true;
+  state.installReturnScreen = state.screen === "installing" ? "empty" : state.screen;
+  state.installLog = [];
+  state.installDone = false;
+  state.installError = "";
+  state.screen = "installing";
+  render();
+  invoke("update_tool", { tool }).catch((err) => {
+    if (!state.installError && !state.installDone) {
+      state.installError = String(err);
+      if (state.screen === "installing") render();
+    }
+  });
+}
+
+async function finishToolUpdate() {
+  try {
+    state.binaries = await invoke<Binaries>("check_binaries");
+  } catch {}
+  await checkForUpdates({ toast: false });
+  state.screen = state.installReturnScreen ?? "empty";
+  state.installReturnScreen = null;
+  state.installTargets = [];
+  state.installIsUpdate = false;
+  render();
+  if (state.settingsOpen) renderSettingsModal();
 }
 
 function restartApp() {
@@ -943,10 +1216,16 @@ async function pickDir() {
 
 async function doAnalyze() {
   if (!isLikelyUrl(state.url)) return;
+  cancelInFlightAnalyze(); // editing + resubmitting replaces whatever was running, not queues alongside it
+  const id = crypto.randomUUID();
+  state.analyzingId = id;
+  const urlAtRequest = state.url; // the link as submitted — further edits don't retarget this request
   state.screen = "analyzing";
   render();
   try {
-    const res = await invoke<AnalyzeResult>("analyze", { url: state.url, ...cookieParams() });
+    const res = await invoke<AnalyzeResult>("analyze", { id, url: urlAtRequest, ...cookieParams() });
+    if (state.analyzingId !== id) return; // superseded by a newer request meanwhile — drop it
+    state.analyzingId = null;
     state.analysis = res;
     state.selectedQualityId = "";
     state.tab = "video";
@@ -960,8 +1239,11 @@ async function doAnalyze() {
       state.screen = "analyzed";
     }
   } catch (err) {
-    state.errorMsg = String(err);
-    state.screen = "error";
+    if (state.analyzingId !== id) return; // superseded (or this is just its own cancellation) — ignore
+    state.analyzingId = null;
+    backToEmptyKeepingUrl();
+    showErrorToast(String(err));
+    return;
   }
   render();
 }
@@ -1032,7 +1314,7 @@ function startPlaylistDownload() {
     audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
     outputDir: state.outputDir,
     writeThumbnail: state.writeThumbnail,
-    writeMetadata: state.writeMetadata,
+    writeDescription: state.writeDescription,
     writeSubs: state.writeSubs,
     playlistItems: items,
   });
@@ -1048,31 +1330,14 @@ function mixContinue() {
     a.webpageUrl = a.webpageUrl.replace(/[?&]list=[^&]+/g, "").replace(/[?&]index=[^&]+/g, "");
     render();
   } else {
-    // capped: download first N as a playlist selection
-    const id = crypto.randomUUID();
-    state.job = {
-      id,
-      percent: 0,
-      speed: "",
-      eta: "",
-      stage: "starting",
-      name: `${a.title} — first ${state.mixN}`,
-      sizeLabel: "",
-    };
-    state.screen = "downloading";
+    // capped: hand off to the same quality-picker screen a real playlist
+    // uses, pre-selecting just the first N entries — "CONTINUE → PICK
+    // QUALITY" should actually let you pick quality, not silently lock in
+    // 1080p and start downloading.
+    state.entrySelected = a.entries.map((_, i) => i < state.mixN);
+    state.selectedQualityId = "";
+    state.screen = "playlist";
     render();
-    runDownload({
-      id,
-      url: a.webpageUrl,
-      formatSelector: "bv*[height<=1080]+ba/b[height<=1080]",
-      kind: "video",
-      audioFormat: null,
-      outputDir: state.outputDir,
-      writeThumbnail: state.writeThumbnail,
-      writeMetadata: state.writeMetadata,
-      writeSubs: state.writeSubs,
-      playlistItems: `1:${state.mixN}`,
-    });
   }
 }
 
@@ -1080,9 +1345,8 @@ function runDownload(req: Record<string, unknown>) {
   invoke("download", { req: { ...req, ...cookieParams() } }).catch((err) => {
     // the dl-error event already handles UI; keep this as a fallback
     if (state.screen === "downloading") {
-      state.errorMsg = String(err);
-      state.screen = "error";
-      render();
+      backToEmptyKeepingUrl();
+      showErrorToast(String(err));
     }
   });
 }
@@ -1126,9 +1390,8 @@ async function wireBackendEvents() {
   await listen<{ id: string; message: string }>("dl-error", (e) => {
     if (!state.job || state.job.id !== e.payload.id) return;
     state.job = null;
-    state.errorMsg = e.payload.message;
-    state.screen = "error";
-    render();
+    backToEmptyKeepingUrl();
+    showErrorToast(e.payload.message);
   });
 
   // installer events
@@ -1239,11 +1502,12 @@ function wireChrome() {
   $("#winMinimize")?.addEventListener("click", () => win.minimize());
   $("#winClose")?.addEventListener("click", () => win.close());
 
-  // pause the toast's auto-dismiss while the pointer is over it
+  // pause the toast's auto-dismiss while the pointer is over it — only
+  // applies to "done"/"error" toasts; "update" toasts have no timer to re-arm
   const toastWrap = $("#toastWrap")!;
   toastWrap.addEventListener("mouseenter", () => window.clearTimeout(toastAutoTimer));
   toastWrap.addEventListener("mouseleave", () => {
-    if (toastWrap.classList.contains("open")) armToastTimer();
+    if (toastWrap.classList.contains("open") && activeToastKind !== "update") armToastTimer();
   });
 }
 
@@ -1276,6 +1540,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     state.installers = { available: false, manager: "", platform: "" };
   }
   render();
+  if (state.binaries?.ytDlp && state.binaries?.ffmpeg) {
+    checkForUpdates(); // fire-and-forget; toasts only if something's outdated
+  }
 
   // Dev-only hook: lets the UI states be driven for visual review without a
   // live yt-dlp backend. Stripped from production builds.
