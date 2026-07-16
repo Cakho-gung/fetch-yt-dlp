@@ -170,6 +170,23 @@ fn spotdl() -> Result<PathBuf, String> {
     })
 }
 
+/// Turns a failed `spawn()` of the spotDL binary into an actionable message.
+/// A raw os error 86 on macOS means the binary's CPU architecture doesn't
+/// match this machine (e.g. an arm64-only release asset on an Intel Mac) —
+/// the portable binary is unusable, so delete it: reinstalling from the
+/// prompt will detect the same mismatch and fall back to `pip install
+/// spotdl` automatically instead of failing the same way on every retry.
+fn spotdl_launch_error(e: std::io::Error, bin: &Path) -> String {
+    if e.raw_os_error() == Some(86) {
+        let _ = std::fs::remove_file(bin);
+        "spotDL's binary doesn't run on this Mac's CPU. Reinstall it from the prompt (or Settings) — \
+         it'll detect that and fall back to a pip install automatically."
+            .to_string()
+    } else {
+        format!("Failed to launch spotDL: {e}")
+    }
+}
+
 /// Which downloader handles a URL. Spotify streams are DRM-protected, so
 /// yt-dlp can't touch them; those links go to spotDL instead, which reads the
 /// track/album/playlist metadata from Spotify, finds the closest match on
@@ -428,7 +445,7 @@ async fn analyze_spotify(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to launch spotDL: {e}"))?;
+        .map_err(|e| spotdl_launch_error(e, &bin))?;
 
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
     let mut stderr = child.stderr.take().ok_or("no stderr")?;
@@ -1217,7 +1234,7 @@ async fn download_spotify(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to launch spotDL: {e}"))?;
+        .map_err(|e| spotdl_launch_error(e, &bin))?;
 
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -1453,6 +1470,11 @@ struct Installers {
     available: bool,
     manager: String, // "mac" | "fetch" | ""
     platform: String,
+    /// Whether `brew` itself resolves right now — checked upfront so the
+    /// frontend can point at the Homebrew install flow *before* the user
+    /// hits "Install" and gets a mid-install failure, rather than only
+    /// finding out reactively from an install-error.
+    brew_available: bool,
 }
 
 #[tauri::command]
@@ -1473,6 +1495,7 @@ fn detect_installers() -> Installers {
         available,
         manager: manager.to_string(),
         platform,
+        brew_available: cfg!(target_os = "macos") && resolve_binary("brew").is_some(),
     }
 }
 
@@ -1534,6 +1557,13 @@ async fn brew_cmd(app: &AppHandle, subcommand: &str, tools: &[String]) -> Result
     if subcommand != "upgrade" {
         cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1");
     }
+    run_streamed_command(app, cmd, "Homebrew reported an error. See the log above.").await
+}
+
+/// Runs `cmd`, streaming its stdout/stderr to the frontend as `install-log`
+/// events as they arrive (used for both Homebrew and pip installs), and
+/// returns `fail_msg` if it exits non-zero.
+async fn run_streamed_command(app: &AppHandle, mut cmd: Command, fail_msg: &str) -> Result<(), String> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1561,7 +1591,7 @@ async fn brew_cmd(app: &AppHandle, subcommand: &str, tools: &[String]) -> Result
         .await
         .map_err(|e| format!("Installer did not exit cleanly: {e}"))?;
     if !status.success() {
-        return Err("Homebrew reported an error. See the log above.".to_string());
+        return Err(fail_msg.to_string());
     }
     Ok(())
 }
@@ -1590,6 +1620,101 @@ async fn mac_curl_download(url: &str, dest: &Path) -> Result<(), String> {
     std::fs::rename(&tmp, dest).map_err(|e| format!("Couldn't save {}: {e}", dest.display()))
 }
 
+/// Runs `dest --version` right after a download so an architecture mismatch
+/// (e.g. an arm64-only release asset landing on an Intel Mac, or vice versa)
+/// is caught immediately as an install error instead of surfacing later, mid
+/// analyze/download, as a bare "Bad CPU type in executable (os error 86)".
+/// Returns the raw spawn error so callers can tell an arch mismatch (os error
+/// 86) apart from anything else and react differently (e.g. fall back to pip).
+#[cfg(target_os = "macos")]
+async fn check_mac_exec(dest: &Path) -> std::io::Result<()> {
+    Command::new(dest).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map(|_| ())
+}
+
+/// Parses "Python 3.9.6" (the format `python3 --version` prints to stdout
+/// since Python 3.4) into `(major, minor)`.
+#[cfg(target_os = "macos")]
+fn parse_python_version(s: &str) -> Option<(u32, u32)> {
+    let rest = s.strip_prefix("Python ")?;
+    let mut parts = rest.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Installs spotDL via pip when the portable binary can't run on this Mac's
+/// CPU — the upstream project only publishes one macOS asset per release, so
+/// if it doesn't match our architecture there's no other portable download
+/// to fall back to. `pip` builds/pulls a wheel for whatever Python is
+/// actually running, sidestepping the architecture problem entirely.
+#[cfg(target_os = "macos")]
+async fn pip_install_spotdl(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut python = resolve_binary("python3");
+
+    // spotDL's yt-dlp dependency hard-errors on Python < 3.10 ("Support for
+    // Python version 3.9 has been deprecated"), which would otherwise turn a
+    // "successful" pip install into a binary that fails on every real
+    // download. macOS ships a 3.9 python3 via the Xcode Command Line Tools —
+    // and on a machine where those tools were never installed, that same
+    // path is a non-functional placeholder that prints nothing and exits
+    // rather than reporting a version — so treat "too old" and "unusable"
+    // the same way: get (or upgrade to) a real 3.10+ via Homebrew.
+    let usable = match &python {
+        Some(p) => {
+            let ver_str = Command::new(p)
+                .arg("--version")
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            matches!(parse_python_version(&ver_str), Some((major, minor)) if (major, minor) >= (3, 10))
+        }
+        None => false,
+    };
+
+    if !usable {
+        let brew = resolve_binary("brew").ok_or(
+            "spotDL needs Python 3.10+, which isn't installed, and Homebrew isn't either — so FETCH \
+             can't get one automatically. Install Python (e.g. from https://python.org) or Homebrew, \
+             then try again.",
+        )?;
+        app.emit("install-log", "Installing a newer Python via Homebrew (spotDL needs 3.10+)…").ok();
+        let mut cmd = Command::new(&brew);
+        cmd.args(["install", "python3"]).env("PATH", augmented_path()).env("HOMEBREW_NO_AUTO_UPDATE", "1");
+        run_streamed_command(app, cmd, "Homebrew couldn't install python3. See the log above.").await?;
+        python = resolve_binary("python3");
+    }
+
+    let python = python.ok_or("Couldn't locate python3 after installing it via Homebrew.")?;
+
+    // A plain `pip install --user` fails on Homebrew's Python with "error:
+    // externally-managed-environment" (PEP 668) — Homebrew's site-packages
+    // refuses pip installs outside a virtual environment. A private venv
+    // under FETCH's own bin dir sidesteps that entirely and keeps spotDL's
+    // dependency tree self-contained, the same way yt-dlp/ffmpeg are already
+    // sandboxed there instead of touching the system Python.
+    let venv_dir = portable_bin_dir().join("spotdl-venv");
+    let mut cmd = Command::new(&python);
+    cmd.args(["-m", "venv", "--clear"]).arg(&venv_dir);
+    run_streamed_command(app, cmd, "Couldn't create a Python environment for spotDL. See the log above.").await?;
+
+    let mut cmd = Command::new(venv_dir.join("bin").join("pip"));
+    cmd.args(["install", "--upgrade", "spotdl"]);
+    run_streamed_command(
+        app,
+        cmd,
+        "pip install spotdl failed. See the log above, or run `pip install spotdl` yourself in a terminal.",
+    )
+    .await?;
+
+    let script = venv_dir.join("bin").join("spotdl");
+    if !script.is_file() {
+        return Err(format!("spotDL installed via pip, but the script wasn't found at {}.", script.display()));
+    }
+    Ok(script)
+}
+
 /// yt-dlp downloads portably (its GitHub release ships a universal
 /// x86_64+arm64 macOS binary, so there's no arch-detection needed). Any
 /// other requested tool (i.e. ffmpeg) still goes through Homebrew.
@@ -1616,6 +1741,15 @@ async fn install_tools_macos(app: &AppHandle, tools: &[String]) -> Result<(), St
             perms.set_mode(0o755);
             std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
 
+            app.emit("install-log", "Verifying yt-dlp runs on this Mac…").ok();
+            if let Err(e) = check_mac_exec(&dest).await {
+                let _ = std::fs::remove_file(&dest);
+                return Err(format!(
+                    "Downloaded yt-dlp but it won't run on this Mac's CPU ({}): {e}",
+                    std::env::consts::ARCH
+                ));
+            }
+
             app.emit("install-log", format!("Saved to {}", dest.display())).ok();
         } else if tool == "spotdl" {
             let bin_dir = portable_bin_dir();
@@ -1633,7 +1767,33 @@ async fn install_tools_macos(app: &AppHandle, tools: &[String]) -> Result<(), St
             perms.set_mode(0o755);
             std::fs::set_permissions(&dest, perms).map_err(|e| e.to_string())?;
 
-            app.emit("install-log", format!("Saved to {}", dest.display())).ok();
+            app.emit("install-log", "Verifying spotDL runs on this Mac…").ok();
+            if let Err(e) = check_mac_exec(&dest).await {
+                let _ = std::fs::remove_file(&dest);
+                // Upstream only ships one macOS asset per release, so an
+                // arch mismatch (os error 86) has no other portable download
+                // to fall back to — go through pip instead, which builds/
+                // pulls a wheel for whatever Python is actually installed.
+                if e.raw_os_error() == Some(86) {
+                    app.emit(
+                        "install-log",
+                        format!(
+                            "spotDL's binary doesn't run on this Mac's CPU ({}) — the latest release only \
+                             ships one for the other architecture. Falling back to `pip install spotdl`…",
+                            std::env::consts::ARCH
+                        ),
+                    )
+                    .ok();
+                    let script = pip_install_spotdl(app).await?;
+                    std::os::unix::fs::symlink(&script, &dest)
+                        .map_err(|e| format!("Couldn't link spotDL: {e}"))?;
+                    app.emit("install-log", format!("Linked spotDL (via pip) at {}", dest.display())).ok();
+                } else {
+                    return Err(format!("Downloaded spotDL but couldn't run it: {e}"));
+                }
+            } else {
+                app.emit("install-log", format!("Saved to {}", dest.display())).ok();
+            }
         } else {
             brew_tools.push(tool.clone());
         }

@@ -1,7 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+
+// ── Lucide SVG icons (inline — no CDN/npm needed) ─────────────────────────
+// Each returns an <svg> string. size defaults to 16. stroke defaults to 2.
+function svg(path: string, size = 16, sw = 2): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;flex-shrink:0">${path}</svg>`;
+}
+// icon path constants (Lucide)
+const IC_X           = `<path d="M18 6 6 18M6 6l12 12"/>`;
+const IC_MINUS       = `<path d="M5 12h14"/>`;
+const IC_DOWNLOAD    = `<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>`;
+const IC_CHECK       = `<path d="M20 6 9 17l-5-5"/>`;
+const IC_ALERT       = `<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>`;
+const IC_ARROW_UP    = `<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>`;
+const IC_FOLDER      = `<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>`;
+const IC_LOADER      = `<path d="M21 12a9 9 0 1 1-6.219-8.56"/>`;
+const IC_REFRESH     = `<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>`;
+const IC_SETTINGS    = `<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>`;
+
 
 // ── types (mirror the Rust structs) ───────────────────────────────────────
 interface Binaries {
@@ -16,6 +35,7 @@ interface Installers {
   available: boolean;
   manager: string; // "mac" | "fetch" | ""
   platform: string;
+  brewAvailable: boolean;
 }
 interface ToolUpdate {
   current?: string;
@@ -287,19 +307,23 @@ function missingBinariesWarn(): string {
   // spotDL download as portable binaries. On Windows ("fetch") everything is
   // portable.
   const brewPart = mgr === "mac" && need.includes("ffmpeg");
+  // Homebrew itself missing is a distinct, upfront-known case (checked once
+  // at startup) — installing would just fail on the ffmpeg step, so point at
+  // the Homebrew setup flow directly instead of trying and failing.
+  const needsHomebrew = brewPart && !state.installers?.brewAvailable;
 
   let label: string;
   let desc: string;
   if (mgr === "fetch") {
-    label = `⇣ DOWNLOAD ${needLabel}`;
+    label = `${svg(IC_DOWNLOAD, 13)} DOWNLOAD ${needLabel}`;
     desc = `FETCH downloads portable copies into its own folder — no system install, no PATH changes.${need.includes("ffmpeg") ? " ffmpeg can take a few minutes." : ""}`;
   } else if (mgr === "mac") {
-    label = `⇣ INSTALL ${needLabel}`;
+    label = `${svg(IC_DOWNLOAD, 13)} INSTALL ${needLabel}`;
     desc = brewPart
       ? `yt-dlp/spotDL download directly; ffmpeg installs via <code>brew</code> — can take a few minutes.`
       : `FETCH downloads portable copies into its own folder — no system install, no PATH changes.`;
   } else {
-    label = "⇣ INSTALL WITH BREW";
+    label = `${svg(IC_DOWNLOAD, 13)} INSTALL WITH BREW`;
     desc = `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`;
   }
 
@@ -310,14 +334,22 @@ function missingBinariesWarn(): string {
   if (brewables.length) manualBits.push(`<code>brew install ${brewables.join(" ")}</code>`);
   if (need.includes("spotdl")) manualBits.push(`<code>pip install spotdl</code>`);
 
-  const actions = canAuto
-    ? `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
+  let actions: string;
+  if (needsHomebrew) {
+    actions = `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
+         <button class="btn btn-primary" id="setupHomebrewBtn" style="font-size:12.5px;display:inline-flex;align-items:center;gap:5px">${svg(IC_DOWNLOAD, 13)} SET UP HOMEBREW</button>
+         <span class="text-muted" style="font-size:11.5px">One-time setup — needed to install ffmpeg${need.includes("spotdl") ? " (and Python, for spotDL)" : ""}.</span>
+       </div>`;
+  } else if (canAuto) {
+    actions = `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
          <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${label}</button>
          <span class="text-muted" style="font-size:11.5px">${desc}</span>
-       </div>`
-    : `<br>Install with ${manualBits.join(" and ")}, then reopen FETCH (make sure they're on PATH).`;
+       </div>`;
+  } else {
+    actions = `<br>Install with ${manualBits.join(" and ")}, then reopen FETCH (make sure they're on PATH).`;
+  }
   return `<div class="warn">
-    <span>⚠</span>
+    <span>${svg(IC_ALERT, 14)}</span>
     <div>Missing <b>${need.join(" + ")}</b> — this link won't analyze or download until installed.${actions}</div>
   </div>`;
 }
@@ -339,33 +371,32 @@ function viewInstalling(): string {
   <div class="blueprint job" style="border-color:var(--color-accent)">${corners}
     <div class="job-top">
       <div class="job-info">
-        <span class="job-name">${
-          errored ? failLabel : done ? doneLabel : `${verb} ${targets.join(" + ").toUpperCase()}…`
-        }</span>
-        <span class="job-stage text-muted">${
-          errored
-            ? esc(state.installError)
-            : needsRestart
-            ? "FETCH needs to restart to pick this up"
-            : done
-            ? (state.installIsUpdate ? "up to date" : "tools are ready")
-            : state.installers?.manager !== "fetch" && targets.includes("ffmpeg")
+        <span class="job-name">${errored ? failLabel : done ? doneLabel : `${verb} ${targets.join(" + ").toUpperCase()}…`
+    }</span>
+        <span class="job-stage text-muted">${errored
+      ? esc(state.installError)
+      : needsRestart
+        ? "FETCH needs to restart to pick this up"
+        : done
+          ? (state.installIsUpdate ? "up to date" : "tools are ready")
+          : state.installers?.manager !== "fetch" && targets.includes("ffmpeg")
             ? "running brew — please wait"
             : "downloading — please wait"
-        }</span>
+    }</span>
       </div>
-      ${
-        needsRestart
-          ? `<button class="btn btn-primary" id="installRestart">⟳ RESTART APP</button>`
-          : done || errored
-          ? `<button class="btn ${done ? "btn-primary" : "btn-secondary"}" id="installBack">${done ? "CONTINUE" : "BACK"}</button>`
-          : ""
-      }
+      ${needsRestart
+      ? `<button class="btn btn-primary" id="installRestart" style="display:inline-flex;align-items:center;gap:5px">${svg(IC_REFRESH, 13)} RESTART APP</button>`
+      : done || errored
+        ? `<div style="display:flex;gap:var(--space-2)">
+               ${errored && isHomebrewMissingError(state.installError) ? `<button class="btn btn-secondary" id="installLearnHow">LEARN HOW</button>` : ""}
+               <button class="btn ${done ? "btn-primary" : "btn-secondary"}" id="installBack">${done ? "CONTINUE" : "BACK"}</button>
+             </div>`
+        : ""
+    }
     </div>
-    ${
-      done || errored
-        ? ""
-        : `<div class="bar indeterminate"><span></span></div>`
+    ${done || errored
+      ? ""
+      : `<div class="bar indeterminate"><span></span></div>`
     }
     <pre class="install-log" id="installLog">${logLines || "starting…"}</pre>
   </div>`;
@@ -404,7 +435,7 @@ function fmtSegHtml(): string {
 
 function dirRow(): string {
   return `<div class="dir-row">
-    <span class="text-muted mono">↧</span>
+    <span class="text-muted mono">${svg(IC_FOLDER, 14)}</span>
     <span class="path" title="${esc(state.outputDir)}">${esc(state.outputDir)}</span>
     <button class="btn btn-ghost" id="pickDir">CHANGE…</button>
   </div>`;
@@ -418,13 +449,13 @@ function renderSettingsModal() {
     <div class="modal">
       <div class="modal-head">
         <span class="section-label">SETTINGS</span>
-        <span class="icon-x" id="settingsClose">✕</span>
+        <span class="icon-x" id="settingsClose">${svg(IC_X, 14)}</span>
       </div>
       <div class="modal-body">
         <div class="settings-group">
           <span class="section-label">DOWNLOAD LOCATION</span>
           <div class="dir-row">
-            <span class="text-muted mono">↧</span>
+            <span class="text-muted mono">${svg(IC_FOLDER, 14)}</span>
             <span class="path" title="${esc(state.outputDir)}">${esc(state.outputDir)}</span>
             <button class="btn btn-ghost" id="settingsPickDir">CHANGE…</button>
           </div>
@@ -435,24 +466,22 @@ function renderSettingsModal() {
           <div class="opts-row">
             <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="none" ${state.cookieMode === "none" ? "checked" : ""}><span class="dot"></span>None</label>
             <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="browser" ${state.cookieMode === "browser" ? "checked" : ""}><span class="dot"></span>Use cookies from browser</label>
-            ${
-              state.cookieMode === "browser"
-                ? `<select class="input" id="cookieBrowserSelect" style="margin-left:24px;width:auto;min-width:160px">
+            ${state.cookieMode === "browser"
+      ? `<select class="input" id="cookieBrowserSelect" style="margin-left:24px;width:auto;min-width:160px">
                     ${COOKIE_BROWSERS.map(
-                      (b) => `<option value="${b}" ${state.cookieBrowser === b ? "selected" : ""}>${b[0].toUpperCase()}${b.slice(1)}</option>`
-                    ).join("")}
+        (b) => `<option value="${b}" ${state.cookieBrowser === b ? "selected" : ""}>${b[0].toUpperCase()}${b.slice(1)}</option>`
+      ).join("")}
                   </select>`
-                : ""
-            }
+      : ""
+    }
             <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="file" ${state.cookieMode === "file" ? "checked" : ""}><span class="dot"></span>Use a cookies.txt file</label>
-            ${
-              state.cookieMode === "file"
-                ? `<div class="dir-row" style="margin-left:24px">
+            ${state.cookieMode === "file"
+      ? `<div class="dir-row" style="margin-left:24px">
                     <span class="path" title="${esc(state.cookieFile)}">${state.cookieFile ? esc(state.cookieFile) : "no file selected"}</span>
                     <button class="btn btn-ghost" id="pickCookieFile">CHOOSE…</button>
                   </div>`
-                : ""
-            }
+      : ""
+    }
           </div>
         </div>
         <div class="settings-group">
@@ -462,7 +491,7 @@ function renderSettingsModal() {
           ${state.binaries?.spotdl ? toolUpdateRow("spotdl", state.updateCheck?.spotdl) : ""}
           <div class="dir-row" style="margin-top:var(--space-2)">
             <button class="btn btn-ghost" id="checkUpdatesBtn" ${state.checkingUpdates ? "disabled" : ""}>
-              ${state.checkingUpdates ? "CHECKING…" : "⟳ CHECK FOR UPDATES"}
+              ${state.checkingUpdates ? "CHECKING…" : `${svg(IC_REFRESH, 13)} CHECK FOR UPDATES`}
             </button>
           </div>
         </div>
@@ -493,10 +522,9 @@ function toolUpdateRow(tool: "yt-dlp" | "ffmpeg" | "spotdl", info: ToolUpdate | 
       <span class="mono" style="font-size:12.5px">${label} ${current}</span>
       ${status}
     </span>
-    ${
-      canUpdate
-        ? `<button class="btn btn-ghost settings-update-btn" data-tool="${esc(tool)}" style="font-size:11.5px">UPDATE</button>`
-        : ""
+    ${canUpdate
+      ? `<button class="btn btn-ghost settings-update-btn" data-tool="${esc(tool)}" style="font-size:11.5px">UPDATE</button>`
+      : ""
     }
   </div>`;
 }
@@ -561,9 +589,12 @@ function closeSettings() {
 }
 
 // ── help / troubleshooting modal ─────────────────────────────────────────
-// Opened from the "LEARN MORE" button on an error toast. Covers the common
-// reasons a download fails — cookies first, since that's the usual culprit
-// for sites like Douyin/TikTok and for age-restricted/private videos.
+// Opened from the "LEARN MORE" button on an error toast (or "LEARN HOW" on a
+// failed install). "download" covers the common reasons a download fails —
+// cookies first, since that's the usual culprit for sites like Douyin/TikTok
+// and for age-restricted/private videos. "homebrew" walks through installing
+// Homebrew by hand when FETCH can't do it for the user.
+type HelpTopic = "download" | "homebrew";
 let helpHideTimer: number | undefined;
 
 // A download error looks cookie-fixable when yt-dlp mentions cookies, sign-in,
@@ -574,6 +605,47 @@ function isCookieError(msg: string): boolean {
   );
 }
 
+// Matches the exact phrasing the Rust backend uses whenever `brew` doesn't
+// resolve — both for ffmpeg's own install and for spotDL's Python fallback
+// on Intel Macs (see `brew_cmd` / `pip_install_spotdl` in src-tauri/src/lib.rs).
+function isHomebrewMissingError(msg: string): boolean {
+  return /homebrew isn'?t installed/i.test(msg);
+}
+
+const BREW_INSTALL_CMD =
+  '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
+
+function homebrewHelpHtml(): string {
+  return `
+    <div class="modal">
+      <div class="modal-head">
+        <span class="section-label">HOMEBREW REQUIRED</span>
+        <span class="icon-x" id="helpClose">${svg(IC_X, 14)}</span>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group">
+          <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-2)">
+            FETCH uses <b>Homebrew</b> to install ffmpeg on macOS — and, on Intel Macs, to get a
+            modern-enough Python for Spotify links. It's a one-time setup.
+          </p>
+          <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-1)">
+            Open <b>Terminal</b>, paste this, and press Enter (it'll ask for your Mac password):
+          </p>
+          <div style="display:flex;gap:var(--space-2);align-items:flex-start;margin-bottom:var(--space-1)">
+            <pre class="install-log" style="flex:1;margin:0;white-space:pre-wrap;word-break:break-all">${esc(BREW_INSTALL_CMD)}</pre>
+            <button class="btn btn-secondary" id="helpCopyBrew" style="flex:none">COPY</button>
+          </div>
+          <p class="text-muted" style="font-size:11.5px;margin:0">
+            Prefer to read first? <a href="#" id="helpBrewLink">brew.sh</a>
+          </p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-primary" id="helpCheckAgain">✓ I'VE INSTALLED IT — CHECK AGAIN</button>
+      </div>
+    </div>`;
+}
+
 function helpModalHtml(highlightCookies: boolean): string {
   const hi = highlightCookies
     ? "border-color:var(--color-accent);background:var(--color-accent-100)"
@@ -582,7 +654,7 @@ function helpModalHtml(highlightCookies: boolean): string {
     <div class="modal">
       <div class="modal-head">
         <span class="section-label">WHY A DOWNLOAD FAILS</span>
-        <span class="icon-x" id="helpClose">✕</span>
+        <span class="icon-x" id="helpClose">${svg(IC_X, 14)}</span>
       </div>
       <div class="modal-body">
         <div class="settings-group" style="border:1px solid var(--color-divider);${hi};padding:var(--space-3)">
@@ -602,7 +674,7 @@ function helpModalHtml(highlightCookies: boolean): string {
             extension like "Get cookies.txt LOCALLY" and use
             <b>"Use a cookies.txt file"</b> instead.
           </p>
-          <button class="btn btn-primary" id="helpOpenSettings" style="font-size:12.5px">⚙ OPEN COOKIE SETTINGS</button>
+          <button class="btn btn-primary" id="helpOpenSettings" style="font-size:24px;display:inline-flex;align-items:center;gap:8px">${svg(IC_SETTINGS, 22)} OPEN COOKIE SETTINGS</button>
         </div>
         <div class="settings-group">
           <span class="section-label">② OUT-OF-DATE TOOL</span>
@@ -625,24 +697,61 @@ function helpModalHtml(highlightCookies: boolean): string {
     </div>`;
 }
 
-function openHelp(highlightCookies = false) {
+function openHelp(topic: HelpTopic = "download", highlightCookies = false) {
   const overlay = document.getElementById("helpOverlay");
   if (!overlay) return;
   window.clearTimeout(helpHideTimer);
   overlay.classList.remove("hidden");
-  overlay.innerHTML = helpModalHtml(highlightCookies);
+  overlay.innerHTML = topic === "homebrew" ? homebrewHelpHtml() : helpModalHtml(highlightCookies);
   document.getElementById("helpClose")?.addEventListener("click", closeHelp);
-  document.getElementById("helpDone")?.addEventListener("click", closeHelp);
-  document.getElementById("helpOpenSettings")?.addEventListener("click", () => {
-    closeHelp();
-    openSettings();
-  });
+  if (topic === "homebrew") {
+    document.getElementById("helpCopyBrew")?.addEventListener("click", copyBrewInstallCmd);
+    document.getElementById("helpCheckAgain")?.addEventListener("click", recheckHomebrew);
+    document.getElementById("helpBrewLink")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      openUrl("https://brew.sh");
+    });
+  } else {
+    document.getElementById("helpDone")?.addEventListener("click", closeHelp);
+    document.getElementById("helpOpenSettings")?.addEventListener("click", () => {
+      closeHelp();
+      openSettings();
+    });
+  }
   // onclick (not addEventListener) so reopening the modal doesn't stack
   // duplicate backdrop handlers on the persistent overlay element.
   overlay.onclick = (e) => {
     if (e.target === overlay) closeHelp();
   };
   requestAnimationFrame(() => overlay.classList.add("open"));
+}
+
+async function copyBrewInstallCmd() {
+  const btn = document.getElementById("helpCopyBrew");
+  try {
+    await navigator.clipboard.writeText(BREW_INSTALL_CMD);
+    if (btn) {
+      const original = btn.textContent;
+      btn.textContent = "COPIED ✓";
+      window.setTimeout(() => {
+        if (document.getElementById("helpCopyBrew")) btn.textContent = original;
+      }, 1500);
+    }
+  } catch { }
+}
+
+// Re-checks whether `brew` resolves now (and re-checks the tools themselves,
+// in case the user also finished an install manually) without forcing a full
+// app restart — the point of this button is to close the loop right here.
+async function recheckHomebrew() {
+  try {
+    state.installers = await invoke<Installers>("detect_installers");
+  } catch { }
+  try {
+    state.binaries = await invoke<Binaries>("check_binaries");
+  } catch { }
+  closeHelp();
+  render();
 }
 
 function closeHelp() {
@@ -693,8 +802,7 @@ function historyTable(): string {
         <td style="width:52px"><span class="tag ${i === 0 ? "tag-accent" : "tag-neutral"}">${esc(h.ext.toUpperCase())}</span></td>
         <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(h.title)}</td>
         <td class="text-muted mono" style="white-space:nowrap;font-size:11px">${esc(h.sizeLabel)} · ${relTime(h.at)}</td>
-        <td style="width:70px;text-align:right">${
-          h.path ? `<button class="btn btn-ghost open-hist" data-path="${esc(h.path)}" style="font-size:12px">OPEN</button>` : ""
+        <td style="width:70px;text-align:right">${h.path ? `<button class="btn btn-ghost open-hist" data-path="${esc(h.path)}" style="font-size:12px">OPEN</button>` : ""
         }</td>
       </tr>`
     )
@@ -737,7 +845,7 @@ function linkInputRow(placeholder: string): string {
   return `<div class="link-row">
     <div class="link-input-wrap">
       <input class="input" id="urlInput" placeholder="${esc(placeholder)}" value="${esc(state.url)}" spellcheck="false" autocomplete="off">
-      ${state.url ? `<span class="icon-x link-clear" id="clearLink" title="Clear">✕</span>` : ""}
+      ${state.url ? `<span class="icon-x link-clear" id="clearLink" title="Clear">${svg(IC_X, 13)}</span>` : ""}
     </div>
     ${statusTag}
     <button class="btn btn-primary" id="analyzeBtn" ${isLikelyUrl(state.url) && ready ? "" : "disabled"}>ANALYZE</button>
@@ -754,10 +862,9 @@ function viewEmpty(): string {
   <div class="grid-analyze">
     <div class="blueprint dropzone">${corners}
       <div class="inner">
-        <span style="font-size:24px">${analyzing ? "◐" : "⇣"}</span>
-        <span class="mono" style="font-size:11px">${
-          analyzing ? "analyzing link…" : "no link yet — paste one to start"
-        }</span>
+        <span style="font-size:24px;display:flex;align-items:center;justify-content:center">${analyzing ? svg(IC_LOADER, 28) : svg(IC_DOWNLOAD, 28)}</span>
+        <span class="mono" style="font-size:11px">${analyzing ? "analyzing link…" : "no link yet — paste one to start"
+    }</span>
         ${state.url && !analyzing ? `<span class="tag tag-accent" style="margin-top:6px">${src} detected</span>` : ""}
       </div>
     </div>
@@ -768,11 +875,11 @@ function viewEmpty(): string {
       </div>
       <div class="qgrid">
         ${["BEST", "1080P", "720P", "480P"]
-          .map(
-            (q) =>
-              `<div class="qcell"><span class="q">${q}</span><span class="sz">— MB</span></div>`
-          )
-          .join("")}
+      .map(
+        (q) =>
+          `<div class="qcell"><span class="q">${q}</span><span class="sz">— MB</span></div>`
+      )
+      .join("")}
       </div>
       <button class="btn btn-primary btn-block" disabled>DOWNLOAD</button>
     </div>
@@ -792,11 +899,10 @@ function viewAnalyzed(): string {
   <div class="grid-analyze">
     <figure class="blueprint preview">${corners}
       <div class="thumb">
-        ${
-          a.thumbnail
-            ? `<img src="${esc(a.thumbnail)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><span class="ph" style="display:none">[ thumbnail unavailable ]</span>`
-            : `<span class="ph">[ no thumbnail ]</span>`
-        }
+        ${a.thumbnail
+      ? `<img src="${esc(a.thumbnail)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><span class="ph" style="display:none">[ thumbnail unavailable ]</span>`
+      : `<span class="ph">[ no thumbnail ]</span>`
+    }
         ${a.durationSeconds ? `<span class="dur">${fmtDuration(a.durationSeconds)}</span>` : ""}
       </div>
       <div class="meta">
@@ -812,24 +918,23 @@ function viewAnalyzed(): string {
       ${fmtSegHtml()}
       <div class="qgrid">
         ${opts
-          .map(
-            (o) =>
-              `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
+      .map(
+        (o) =>
+          `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
                  <span class="q">${esc(o.label)}</span>
                  <span class="sz">≈ ${fmtBytes(o.approxBytes)}</span>
                </div>`
-          )
-          .join("")}
-        ${
-          state.tab === "audio" && a.videoOptions.length > opts.length
-            ? Array(a.videoOptions.length - opts.length)
-                .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
-                .join("")
-            : ""
-        }
+      )
+      .join("")}
+        ${state.tab === "audio" && a.videoOptions.length > opts.length
+      ? Array(a.videoOptions.length - opts.length)
+        .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
+        .join("")
+      : ""
+    }
       </div>
       ${optsRow()}
-      <button class="btn btn-primary btn-block" id="downloadBtn">⇣ DOWNLOAD · ${fmtBytes(selected.approxBytes).replace("— MB", "best")}</button>
+      <button class="btn btn-primary btn-block" id="downloadBtn" style="display:inline-flex;align-items:center;gap:6px">${svg(IC_DOWNLOAD, 15)} DOWNLOAD · ${fmtBytes(selected.approxBytes).replace("— MB", "best")}</button>
     </div>
   </div>
   ${dirRow()}
@@ -849,10 +954,9 @@ function viewPlaylist(): string {
     .map((e, i) => {
       const sel = state.entrySelected[i];
       return `<label class="queue-row" style="cursor:pointer;${sel ? "background:var(--color-accent-100)" : ""}" data-entry="${i}">
-        <span style="width:14px;height:14px;flex:none;display:grid;place-items:center;font-size:9px;${
-          sel
-            ? "background:var(--color-accent);color:var(--color-bg)"
-            : "border:1px solid var(--color-neutral-400)"
+        <span style="width:14px;height:14px;flex:none;display:grid;place-items:center;font-size:9px;${sel
+          ? "background:var(--color-accent);color:var(--color-bg)"
+          : "border:1px solid var(--color-neutral-400)"
         }">${sel ? "✓" : ""}</span>
         <span class="idx mono">${String(e.index).padStart(2, "0")}</span>
         <span class="nm" style="${sel ? "" : "color:var(--color-neutral-700)"}">${esc(e.title)}</span>
@@ -878,24 +982,23 @@ function viewPlaylist(): string {
       ${fmtSegHtml()}
       <div class="qgrid">
         ${opts
-          .map(
-            (o) =>
-              `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
+      .map(
+        (o) =>
+          `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
                  <span class="q">${esc(o.label)}</span>
                  <span class="sz">≈ ${fmtBytes(o.approxBytes)}</span>
                </div>`
-          )
-          .join("")}
-        ${
-          state.tab === "audio" && a.videoOptions.length > opts.length
-            ? Array(a.videoOptions.length - opts.length)
-                .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
-                .join("")
-            : ""
-        }
+      )
+      .join("")}
+        ${state.tab === "audio" && a.videoOptions.length > opts.length
+      ? Array(a.videoOptions.length - opts.length)
+        .fill(`<div class="qcell" style="visibility:hidden;pointer-events:none"></div>`)
+        .join("")
+      : ""
+    }
       </div>
       ${optsRow()}
-      <button class="btn btn-primary btn-block" id="downloadPlaylist" ${selCount ? "" : "disabled"}>⇣ DOWNLOAD ${selCount} SELECTED</button>
+      <button class="btn btn-primary btn-block" id="downloadPlaylist" ${selCount ? "" : "disabled"} style="display:inline-flex;align-items:center;gap:6px">${svg(IC_DOWNLOAD, 15)} DOWNLOAD ${selCount} SELECTED</button>
     </div>
   </div>
   ${dirRow()}`;
@@ -918,11 +1021,11 @@ function viewMix(): string {
         <label class="radio"><input type="radio" name="mix" ${state.mixMode === "capped" ? "checked" : ""}><span class="dot"></span><span style="font:600 14px var(--font-heading)">FIRST N OF THE MIX</span></label>
         <div class="seg">
           ${[5, 10, 15, 25]
-            .map(
-              (n) =>
-                `<label class="seg-opt mixn" data-n="${n}"><input type="radio" name="mixn" ${state.mixN === n ? "checked" : ""}>${n}</label>`
-            )
-            .join("")}
+      .map(
+        (n) =>
+          `<label class="seg-opt mixn" data-n="${n}"><input type="radio" name="mixn" ${state.mixN === n ? "checked" : ""}>${n}</label>`
+      )
+      .join("")}
         </div>
       </div>
     </div>
@@ -938,10 +1041,10 @@ function viewDownloading(): string {
     j.stage === "merging"
       ? "merging streams (FFmpeg)…"
       : j.stage === "extracting"
-      ? "extracting audio (FFmpeg)…"
-      : j.stage === "starting"
-      ? "starting…"
-      : "downloading";
+        ? "extracting audio (FFmpeg)…"
+        : j.stage === "starting"
+          ? "starting…"
+          : "downloading";
   return `
   <div class="link-row" style="opacity:.6">
     <input class="input mono" style="flex:1;min-height:42px;font-size:13px" placeholder="Paste another link when this finishes" disabled>
@@ -953,7 +1056,7 @@ function viewDownloading(): string {
         <span class="job-name">${esc(j.name)}</span>
         <span class="job-stage text-muted">${stageText}</span>
       </div>
-      <button class="btn btn-secondary btn-icon" id="cancelBtn" title="Cancel">✕</button>
+      <button class="btn btn-secondary btn-icon" id="cancelBtn" title="Cancel">${svg(IC_X, 14)}</button>
     </div>
     <div style="display:flex;flex-direction:column;gap:var(--space-2)">
       <div class="bar ${indeterminate ? "indeterminate" : ""}" id="bar"><span id="barFill" style="width:${Math.max(0, Math.min(100, j.percent))}%"></span></div>
@@ -983,6 +1086,8 @@ function wireEvents() {
   $("#installBtn")?.addEventListener("click", startInstall);
   $("#installBack")?.addEventListener("click", () => (state.installIsUpdate ? finishToolUpdate() : finishInstall()));
   $("#installRestart")?.addEventListener("click", restartApp);
+  $("#setupHomebrewBtn")?.addEventListener("click", () => openHelp("homebrew"));
+  $("#installLearnHow")?.addEventListener("click", () => openHelp("homebrew"));
 
   // format tabs (video/audio)
   body()
@@ -1069,7 +1174,7 @@ function wireEvents() {
 // never land and clobber what's on screen.
 function cancelInFlightAnalyze() {
   if (state.analyzingId) {
-    invoke("cancel_analyze", { id: state.analyzingId }).catch(() => {});
+    invoke("cancel_analyze", { id: state.analyzingId }).catch(() => { });
     state.analyzingId = null;
   }
 }
@@ -1127,13 +1232,13 @@ function showDoneToast(item: HistoryItem) {
   wrap.classList.remove("hidden");
   wrap.innerHTML = `
     <div class="banner toast">
-      <span class="ok">✓</span>
+      <span class="ok">${svg(IC_CHECK, 18, 2.5)}</span>
       <div class="b-txt">
         <span class="b-ttl">DONE — SAVED TO DISK</span>
         <span class="b-sub" title="${esc(item.path ?? "")}">${esc(item.path ?? item.title)}${item.sizeLabel ? ` · ${item.sizeLabel}` : ""}</span>
       </div>
       ${item.path ? `<button class="btn btn-primary open-hist" data-path="${esc(item.path)}" style="flex:none">OPEN FOLDER</button>` : ""}
-      <span class="icon-x" id="toastClose">✕</span>
+      <span class="icon-x" id="toastClose">${svg(IC_X, 14)}</span>
     </div>`;
   wrap.querySelector<HTMLElement>(".open-hist")?.addEventListener("click", (e) =>
     invoke("reveal_in_folder", { path: (e.currentTarget as HTMLElement).dataset.path })
@@ -1149,21 +1254,22 @@ function showErrorToast(message: string) {
   window.clearTimeout(toastCleanupTimer);
   activeToastKind = "error";
   wrap.classList.remove("hidden");
+  const homebrewHint = isHomebrewMissingError(message);
   const cookieHint = isCookieError(message);
   wrap.innerHTML = `
     <div class="banner toast error">
-      <span class="ok">!</span>
+      <span class="ok">${svg(IC_ALERT, 18, 2)}</span>
       <div class="b-txt">
         <span class="b-ttl">COULDN'T DO THAT</span>
         <span class="b-sub" style="white-space:normal">${esc(message)}</span>
       </div>
-      <button class="btn btn-secondary" id="toastLearnMore" style="flex:none">LEARN MORE</button>
-      <span class="icon-x" id="toastClose">✕</span>
+      <button class="btn btn-secondary" id="toastLearnMore" style="flex:none">${homebrewHint ? "LEARN HOW" : "LEARN MORE"}</button>
+      <span class="icon-x" id="toastClose">${svg(IC_X, 14)}</span>
     </div>`;
   document.getElementById("toastClose")?.addEventListener("click", dismissToast);
   document.getElementById("toastLearnMore")?.addEventListener("click", () => {
     dismissToast();
-    openHelp(cookieHint);
+    openHelp(homebrewHint ? "homebrew" : "download", cookieHint);
   });
   requestAnimationFrame(() => wrap.classList.add("open"));
   armToastTimer();
@@ -1225,7 +1331,7 @@ async function checkForUpdates(opts: { toast: boolean } = { toast: true }) {
     // Don't steal the slot from an in-progress download-completion toast —
     // it'll resurface on its own once that one clears.
     if (items.length && activeToastKind !== "done") showUpdateToast(items);
-  } catch {}
+  } catch { }
 }
 
 // Local-only (no network) version lookup — resolves near-instantly, unlike
@@ -1238,13 +1344,13 @@ async function loadInstalledVersions() {
     const local = await invoke<UpdateCheck>("installed_versions");
     state.updateCheck = state.updateCheck
       ? {
-          ytDlp: { ...state.updateCheck.ytDlp, current: local.ytDlp.current, source: local.ytDlp.source },
-          ffmpeg: { ...state.updateCheck.ffmpeg, current: local.ffmpeg.current, source: local.ffmpeg.source },
-          spotdl: { ...state.updateCheck.spotdl, current: local.spotdl.current, source: local.spotdl.source },
-        }
+        ytDlp: { ...state.updateCheck.ytDlp, current: local.ytDlp.current, source: local.ytDlp.source },
+        ffmpeg: { ...state.updateCheck.ffmpeg, current: local.ffmpeg.current, source: local.ffmpeg.source },
+        spotdl: { ...state.updateCheck.spotdl, current: local.spotdl.current, source: local.spotdl.source },
+      }
       : local;
     if (state.settingsOpen) renderSettingsModal();
-  } catch {}
+  } catch { }
 }
 
 function showUpdateToast(items: { tool: string; label: string; from?: string; to?: string }[]) {
@@ -1267,9 +1373,9 @@ function showUpdateToast(items: { tool: string; label: string; from?: string; to
     .join("");
   wrap.innerHTML = `
     <div class="banner toast" id="updateToast">
-      <span class="ok">⇪</span>
+      <span class="ok">${svg(IC_ARROW_UP, 18, 2.5)}</span>
       ${rows}
-      <span class="icon-x" id="updateToastClose">✕</span>
+      <span class="icon-x" id="updateToastClose">${svg(IC_X, 14)}</span>
     </div>`;
   wrap.querySelectorAll<HTMLButtonElement>(".update-tool-btn").forEach((btn) =>
     btn.addEventListener("click", () => {
@@ -1305,7 +1411,7 @@ function startInstall() {
 async function finishInstall() {
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
-  } catch {}
+  } catch { }
   resetToEmpty();
 }
 
@@ -1333,7 +1439,7 @@ function startToolUpdate(tool: string) {
 async function finishToolUpdate() {
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
-  } catch {}
+  } catch { }
   await checkForUpdates({ toast: false });
   state.screen = state.installReturnScreen ?? "empty";
   state.installReturnScreen = null;
@@ -1344,7 +1450,7 @@ async function finishToolUpdate() {
 }
 
 function restartApp() {
-  invoke("restart_app").catch(() => {});
+  invoke("restart_app").catch(() => { });
 }
 
 function appendInstallLog() {
@@ -1450,14 +1556,14 @@ function startPlaylistDownload() {
   // ticked (newline-joined); yt-dlp takes a comma-separated index list.
   const items = isSpotify
     ? a.entries
-        .filter((_, i) => state.entrySelected[i])
-        .map((e) => e.url)
-        .filter(Boolean)
-        .join("\n")
+      .filter((_, i) => state.entrySelected[i])
+      .map((e) => e.url)
+      .filter(Boolean)
+      .join("\n")
     : a.entries
-        .filter((_, i) => state.entrySelected[i])
-        .map((e) => e.index)
-        .join(",");
+      .filter((_, i) => state.entrySelected[i])
+      .map((e) => e.index)
+      .join(",");
   if (!items) return;
   const sel = currentSelection();
   if (!sel) return;
@@ -1581,7 +1687,7 @@ async function wireBackendEvents() {
     for (let attempt = 0; attempt < 6; attempt++) {
       try {
         state.binaries = await invoke<Binaries>("check_binaries");
-      } catch {}
+      } catch { }
       if (missingTools().length === 0) break;
       await new Promise((r) => setTimeout(r, 400));
     }
@@ -1609,8 +1715,8 @@ function patchProgress() {
     j.stage === "merging"
       ? "merging streams (FFmpeg)…"
       : j.stage === "extracting"
-      ? "extracting audio (FFmpeg)…"
-      : "downloading";
+        ? "extracting audio (FFmpeg)…"
+        : "downloading";
   if (pct) pct.textContent = indeterminate ? stageText : `${j.percent.toFixed(0)}%`;
   if (eta) eta.textContent = `${j.speed}${j.eta ? ` · ${j.eta} left` : ""}`;
   if (stageEl) stageEl.textContent = stageText;
@@ -1620,13 +1726,13 @@ function patchProgress() {
 function persistHistory() {
   try {
     localStorage.setItem("fetch.history", JSON.stringify(state.history.slice(0, 30)));
-  } catch {}
+  } catch { }
 }
 function loadHistory() {
   try {
     const raw = localStorage.getItem("fetch.history");
     if (raw) state.history = JSON.parse(raw);
-  } catch {}
+  } catch { }
 }
 
 function persistSettings() {
@@ -1640,7 +1746,7 @@ function persistSettings() {
         cookieFile: state.cookieFile,
       })
     );
-  } catch {}
+  } catch { }
 }
 let hasSavedOutputDir = false;
 function loadSettings() {
@@ -1657,7 +1763,7 @@ function loadSettings() {
     }
     if (typeof s.cookieBrowser === "string" && s.cookieBrowser) state.cookieBrowser = s.cookieBrowser;
     if (typeof s.cookieFile === "string") state.cookieFile = s.cookieFile;
-  } catch {}
+  } catch { }
 }
 
 // ── theme toggle ─────────────────────────────────────────────────────────
@@ -1701,7 +1807,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (!hasSavedOutputDir) {
     try {
       state.outputDir = await invoke<string>("default_download_dir");
-    } catch {}
+    } catch { }
   }
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
@@ -1711,7 +1817,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     state.installers = await invoke<Installers>("detect_installers");
   } catch {
-    state.installers = { available: false, manager: "", platform: "" };
+    state.installers = { available: false, manager: "", platform: "", brewAvailable: false };
   }
   render();
   if (state.binaries?.ytDlp && state.binaries?.ffmpeg) {
