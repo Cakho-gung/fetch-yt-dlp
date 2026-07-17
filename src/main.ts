@@ -11,7 +11,6 @@ function svg(path: string, size = 16, sw = 2): string {
 }
 // icon path constants (Lucide)
 const IC_X           = `<path d="M18 6 6 18M6 6l12 12"/>`;
-const IC_MINUS       = `<path d="M5 12h14"/>`;
 const IC_DOWNLOAD    = `<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>`;
 const IC_CHECK       = `<path d="M20 6 9 17l-5-5"/>`;
 const IC_ALERT       = `<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>`;
@@ -47,6 +46,11 @@ interface UpdateCheck {
   ytDlp: ToolUpdate;
   ffmpeg: ToolUpdate;
   spotdl: ToolUpdate;
+}
+interface CookieImportResult {
+  path: string;
+  cookieCount: number;
+  warning?: string;
 }
 interface QualityOption {
   id: string;
@@ -136,11 +140,24 @@ const state = {
   entrySelected: [] as boolean[],
   mixMode: "single" as "single" | "capped",
   mixN: 10,
+  // Set right before an analyze() call that's meant to actually resolve a
+  // mix (as opposed to the URL-pattern short-circuit in doAnalyze() that
+  // shows the chooser with zero backend calls) — tells the completion
+  // handler what to do once the real entries come back.
+  mixResolving: null as "capped" | null,
   // settings
   settingsOpen: false,
-  cookieMode: "none" as "none" | "browser" | "file",
-  cookieBrowser: "chrome",
+  cookieMode: "none" as "none" | "file",
+  cookieBrowser: "chrome", // last browser picked for "Import from browser"
   cookieFile: "",
+  cookieImport: { state: "idle", message: "" } as CookieImportState,
+  cookieImportModal: { open: false, browser: "chrome", id: null as string | null },
+  cookieImportStopRequested: false,
+};
+
+type CookieImportState = {
+  state: "idle" | "busy" | "done" | "error";
+  message: string;
 };
 
 const COOKIE_BROWSERS = ["chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari"];
@@ -195,6 +212,11 @@ function detectSource(url: string): string {
   }
 }
 const isLikelyUrl = (s: string) => /^https?:\/\/\S+\.\S+/.test(s.trim());
+// Mirrors the `is_mix` check in src-tauri/src/lib.rs (playlist_id.starts_with("RD")
+// || url.contains("list=RD")) — a YouTube auto-generated Mix/Radio always carries
+// a "list=RD…" param, so this is knowable straight from the pasted link, no
+// analyze round-trip required.
+const isLikelyMixUrl = (s: string) => /[?&]list=RD/.test(s);
 
 // A user-facing file extension for an audio tier id ("mp3-320" → "mp3",
 // "m4a" → "m4a"). "original" keeps the source codec, whose real extension is
@@ -441,10 +463,113 @@ function dirRow(): string {
   </div>`;
 }
 
+// ── cookies: import-from-browser + manual file ──────────────────────────
+function cookieFileSectionHtml(): string {
+  return `<div style="margin-left:24px;display:flex;flex-direction:column;gap:var(--space-2);width:100%">
+    <div class="dir-row">
+      <span class="text-muted mono">${svg(IC_FOLDER, 14)}</span>
+      <span class="path" title="${esc(state.cookieFile)}">${state.cookieFile ? esc(state.cookieFile) : "no cookie file yet"}</span>
+      <button class="btn btn-ghost" id="pickCookieFile">CHOOSE FILE…</button>
+    </div>
+    <div class="dir-row">
+      <button class="btn btn-ghost" id="openCookieImportBtn">${svg(IC_REFRESH, 13)} IMPORT FROM BROWSER…</button>
+    </div>
+    ${cookieImportStatusHtml()}
+  </div>`;
+}
+
+function cookieImportStatusHtml(): string {
+  const s = state.cookieImport;
+  if (s.state === "idle" || s.state === "busy" || !s.message) return "";
+  const icon = s.state === "error" ? svg(IC_ALERT, 12, 2) : svg(IC_CHECK, 12, 2.5);
+  return `<p class="text-muted" style="font-size:11.5px;margin:0;display:flex;align-items:center;gap:6px">${icon}<span>${esc(s.message)}</span></p>`;
+}
+
+// A separate view swapped into the same #settingsOverlay modal (rather than
+// a second overlay) — its own confirm step, since asking the user through
+// window.confirm() gave no visual cue in the Tauri webview.
+function cookieImportModalHtml(): string {
+  const browser = state.cookieImportModal.browser;
+  const label = browser[0].toUpperCase() + browser.slice(1);
+  const s = state.cookieImport;
+  const busy = s.state === "busy";
+  const settled = s.state === "done" || s.state === "error";
+
+  const body = settled
+    ? `<div class="settings-group">
+        <p class="text-muted" style="font-size:12.5px;display:flex;align-items:center;gap:8px;margin:0">
+          ${s.state === "error" ? svg(IC_ALERT, 16, 2) : svg(IC_CHECK, 16, 2.5)}
+          <span>${esc(s.message)}</span>
+        </p>
+      </div>`
+    : busy
+      ? `<div class="settings-group">
+          <p class="text-muted" style="font-size:12.5px;display:flex;align-items:center;gap:8px;margin:0">
+            ${svg(IC_LOADER, 14)}<span>${esc(s.message || "Working…")}</span>
+          </p>
+          <p class="text-muted" style="font-size:11.5px;margin:var(--space-2) 0 0">
+            ${state.cookieImportStopRequested
+        ? "Stopping…"
+        : "This can take a couple of minutes the first time — macOS has to verify the yt-dlp binary before it runs. Feel free to stop it below."
+      }
+          </p>
+        </div>`
+      : `<div class="settings-group">
+          <span class="section-label">BROWSER</span>
+          <select class="input" id="cookieImportBrowserSelect" style="width:100%;margin-top:var(--space-1)">
+            ${COOKIE_BROWSERS.map(
+        (b) => `<option value="${b}" ${browser === b ? "selected" : ""}>${b[0].toUpperCase()}${b.slice(1)}</option>`
+      ).join("")}
+          </select>
+        </div>
+        <div class="settings-group">
+          <p class="text-muted" style="font-size:12.5px;margin:0">
+            FETCH will close <b>${label}</b> if it's currently open, read its saved cookies, then reopen it automatically. Any unsaved tabs/forms in it could be lost.
+          </p>
+          <p class="text-muted" style="font-size:11.5px;margin:var(--space-2) 0 0">
+            This can take up to 2–3 minutes on the first run.
+          </p>
+        </div>`;
+
+  const foot = settled
+    ? `${s.state === "error" ? `<button class="btn btn-ghost" id="cookieImportRetry">TRY AGAIN</button>` : ""}
+       <button class="btn btn-primary" id="cookieImportCloseBtn">CLOSE</button>`
+    : busy
+      ? `<button class="btn btn-ghost" id="cookieImportStop" ${state.cookieImportStopRequested ? "disabled" : ""}>
+           ${state.cookieImportStopRequested ? "STOPPING…" : "STOP"}
+         </button>`
+      : `<button class="btn btn-ghost" id="cookieImportCancel">CANCEL</button>
+         <button class="btn btn-primary" id="cookieImportStart">CONTINUE</button>`;
+
+  // No X while busy: closing mid-run would orphan a running extraction
+  // (and a closed browser) with no visible way back in — STOP is the only
+  // way out until it settles.
+  return `
+    <div class="modal">
+      <div class="modal-head">
+        <span class="section-label">IMPORT COOKIES FROM BROWSER</span>
+        ${busy ? "" : `<span class="icon-x" id="cookieImportClose">${svg(IC_X, 14)}</span>`}
+      </div>
+      <div class="modal-body">${body}</div>
+      <div class="modal-foot">${foot}</div>
+    </div>`;
+}
+
+function openCookieImportModal() {
+  state.cookieImportModal = { open: true, browser: state.cookieBrowser, id: null };
+  state.cookieImport = { state: "idle", message: "" };
+  renderSettingsModal();
+}
+
 // ── settings modal ──────────────────────────────────────────────────────
 function renderSettingsModal() {
   const overlay = document.getElementById("settingsOverlay");
   if (!overlay || !state.settingsOpen) return;
+  if (state.cookieImportModal.open) {
+    overlay.innerHTML = cookieImportModalHtml();
+    wireCookieImportEvents();
+    return;
+  }
   overlay.innerHTML = `
     <div class="modal">
       <div class="modal-head">
@@ -465,23 +590,8 @@ function renderSettingsModal() {
           <p class="text-muted" style="font-size:12px;margin:var(--space-1) 0 var(--space-2)">Needed for age-restricted, members-only or private videos.</p>
           <div class="opts-row">
             <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="none" ${state.cookieMode === "none" ? "checked" : ""}><span class="dot"></span>None</label>
-            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="browser" ${state.cookieMode === "browser" ? "checked" : ""}><span class="dot"></span>Use cookies from browser</label>
-            ${state.cookieMode === "browser"
-      ? `<select class="input" id="cookieBrowserSelect" style="margin-left:24px;width:auto;min-width:160px">
-                    ${COOKIE_BROWSERS.map(
-        (b) => `<option value="${b}" ${state.cookieBrowser === b ? "selected" : ""}>${b[0].toUpperCase()}${b.slice(1)}</option>`
-      ).join("")}
-                  </select>`
-      : ""
-    }
-            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="file" ${state.cookieMode === "file" ? "checked" : ""}><span class="dot"></span>Use a cookies.txt file</label>
-            ${state.cookieMode === "file"
-      ? `<div class="dir-row" style="margin-left:24px">
-                    <span class="path" title="${esc(state.cookieFile)}">${state.cookieFile ? esc(state.cookieFile) : "no file selected"}</span>
-                    <button class="btn btn-ghost" id="pickCookieFile">CHOOSE…</button>
-                  </div>`
-      : ""
-    }
+            <label class="radio" style="font-size:13px"><input type="radio" name="cookieMode" value="file" ${state.cookieMode === "file" ? "checked" : ""}><span class="dot"></span>Use cookies</label>
+            ${state.cookieMode === "file" ? cookieFileSectionHtml() : ""}
           </div>
         </div>
         <div class="settings-group">
@@ -532,20 +642,25 @@ function toolUpdateRow(tool: "yt-dlp" | "ffmpeg" | "spotdl", info: ToolUpdate | 
 function wireSettingsEvents() {
   document.getElementById("settingsClose")?.addEventListener("click", closeSettings);
   document.getElementById("settingsDone")?.addEventListener("click", closeSettings);
-  document.getElementById("settingsOverlay")?.addEventListener("click", (e) => {
-    if (e.target === document.getElementById("settingsOverlay")) closeSettings();
-  });
+  // onclick (not addEventListener): #settingsOverlay is a persistent node
+  // that both this view and the cookie-import sub-view render into, so
+  // addEventListener would stack a handler from each past render instead of
+  // replacing it — including a stale unconditional-close one firing over a
+  // busy import popup that's supposed to block closing.
+  const overlay = document.getElementById("settingsOverlay");
+  if (overlay) {
+    overlay.onclick = (e) => {
+      if (e.target === overlay) closeSettings();
+    };
+  }
   document.getElementById("settingsPickDir")?.addEventListener("click", pickDir);
   document.getElementById("pickCookieFile")?.addEventListener("click", pickCookieFile);
-  document.getElementById("cookieBrowserSelect")?.addEventListener("change", (e) => {
-    state.cookieBrowser = (e.target as HTMLSelectElement).value;
-    persistSettings();
-  });
+  document.getElementById("openCookieImportBtn")?.addEventListener("click", openCookieImportModal);
   document
     .querySelectorAll<HTMLInputElement>('input[name="cookieMode"]')
     .forEach((r) =>
       r.addEventListener("change", () => {
-        state.cookieMode = r.value as "none" | "browser" | "file";
+        state.cookieMode = r.value as "none" | "file";
         persistSettings();
         renderSettingsModal();
       })
@@ -579,6 +694,7 @@ function openSettings() {
 let settingsHideTimer: number | undefined;
 function closeSettings() {
   state.settingsOpen = false;
+  state.cookieImportModal.open = false;
   const overlay = document.getElementById("settingsOverlay");
   if (!overlay) return;
   overlay.classList.remove("open");
@@ -665,14 +781,15 @@ function helpModalHtml(highlightCookies: boolean): string {
             them as an anti-bot token.
           </p>
           <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-2)">
-            Open a page from that site in your browser once, then here:
-            <b>Settings → Cookies → "Use cookies from browser"</b> and pick that browser.
+            Log into that site in your browser once, then here:
+            <b>Settings → Cookies → "Use cookies" → Import from browser</b> — FETCH reads the
+            cookies straight from your browser (closing/reopening it if it's open) and saves
+            them to a file, so you won't need the browser again until they expire.
           </p>
           <p class="text-muted" style="font-size:12.5px;margin:0 0 var(--space-2)">
-            <b>If that fails on Windows</b> (Chrome/Edge lock &amp; encrypt their cookies):
-            close the browser fully and retry, or export a <code>cookies.txt</code> with an
-            extension like "Get cookies.txt LOCALLY" and use
-            <b>"Use a cookies.txt file"</b> instead.
+            <b>If the import itself fails</b>: it'll tell you why (browser still in use, macOS
+            Keychain blocked it, or no cookies found for that site). You can also point
+            <b>"Choose file…"</b> at a <code>cookies.txt</code> exported by hand.
           </p>
           <button class="btn btn-primary" id="helpOpenSettings" style="font-size:24px;display:inline-flex;align-items:center;gap:8px">${svg(IC_SETTINGS, 22)} OPEN COOKIE SETTINGS</button>
         </div>
@@ -771,15 +888,114 @@ async function pickCookieFile() {
   });
   if (typeof picked === "string") {
     state.cookieFile = picked;
+    state.cookieImport = { state: "idle", message: "" };
     persistSettings();
     renderSettingsModal();
   }
 }
 
+function closeCookieImportModal() {
+  state.cookieImportModal.open = false;
+  renderSettingsModal();
+}
+
+function wireCookieImportEvents() {
+  // onclick, not addEventListener — see the comment in wireSettingsEvents().
+  const overlay = document.getElementById("settingsOverlay");
+  if (overlay) {
+    overlay.onclick = (e) => {
+      if (e.target === overlay && state.cookieImport.state !== "busy") {
+        closeCookieImportModal();
+      }
+    };
+  }
+  document.getElementById("cookieImportBrowserSelect")?.addEventListener("change", (e) => {
+    state.cookieImportModal.browser = (e.target as HTMLSelectElement).value;
+  });
+  document.getElementById("cookieImportCancel")?.addEventListener("click", closeCookieImportModal);
+  document.getElementById("cookieImportClose")?.addEventListener("click", closeCookieImportModal);
+  document.getElementById("cookieImportCloseBtn")?.addEventListener("click", closeCookieImportModal);
+  document.getElementById("cookieImportStart")?.addEventListener("click", importCookiesFromBrowser);
+  document.getElementById("cookieImportStop")?.addEventListener("click", stopCookieImport);
+  document.getElementById("cookieImportRetry")?.addEventListener("click", () => {
+    state.cookieImport = { state: "idle", message: "" };
+    renderSettingsModal();
+  });
+}
+
+// Marks the import stopped right away rather than waiting on the backend
+// round-trip — spawn()ing/killing yt-dlp can itself sit blocked for a while
+// (macOS re-verifying the portable binary), so waiting for that confirmation
+// before updating the UI made STOP feel just as stuck as the thing it's
+// meant to escape. The kill request still goes out in the background: it's
+// safe to walk away from, since `import_cookies_from_browser` reopens the
+// browser and cleans up server-side regardless of whether anyone's still
+// watching (see lib.rs) — `stillActive()` below just stops that eventual
+// result from clobbering whatever the UI has moved on to.
+function stopCookieImport() {
+  const id = state.cookieImportModal.id;
+  if (!id || state.cookieImportStopRequested) return;
+  state.cookieImportStopRequested = true;
+  state.cookieImportModal.id = null;
+  state.cookieImport = { state: "error", message: "Stopped." };
+  renderSettingsModal();
+  invoke("cancel_cookie_import", { id }).catch(() => { });
+}
+
+// Snapshots cookies from the browser picked in the import popup into a file
+// (closing/reopening the browser around it if it's currently running) and
+// points cookieFile at the result — see `import_cookies_from_browser` in
+// src-tauri/src/lib.rs. The popup itself (browser picker + "will close/
+// reopen the browser" notice) is the confirmation step, so this runs
+// straight through once "CONTINUE" is clicked.
+async function importCookiesFromBrowser() {
+  const browser = state.cookieImportModal.browser;
+  state.cookieBrowser = browser; // remember the choice for next time
+  const label = browser[0].toUpperCase() + browser.slice(1);
+  const id = crypto.randomUUID();
+  state.cookieImportModal.id = id;
+  state.cookieImportStopRequested = false;
+  // True as long as nothing else (STOP, or a fresh attempt) has taken over
+  // since this one started — an already-stopped run's late result shouldn't
+  // overwrite whatever's on screen now.
+  const stillActive = () => state.cookieImportModal.id === id;
+
+  state.cookieImport = { state: "busy", message: `Checking ${label}…` };
+  renderSettingsModal();
+
+  try {
+    const running = await invoke<boolean>("browser_is_running", { browser });
+    if (!stillActive()) return;
+    state.cookieImport = {
+      state: "busy",
+      message: running ? `Closing ${label}, reading cookies, then reopening it…` : `Reading cookies from ${label}…`,
+    };
+    renderSettingsModal();
+
+    const result = await invoke<CookieImportResult>("import_cookies_from_browser", {
+      id,
+      browser,
+      probeUrl: state.analysis?.webpageUrl || state.url || null,
+    });
+    if (!stillActive()) return;
+
+    state.cookieFile = result.path;
+    persistSettings();
+    state.cookieImport = {
+      state: "done",
+      message: result.warning ?? `Imported ${result.cookieCount} cookies from ${label}.`,
+    };
+  } catch (err) {
+    if (!stillActive()) return;
+    state.cookieImport = { state: "error", message: String(err) };
+  }
+  state.cookieImportModal.id = null;
+  renderSettingsModal();
+}
+
 function cookieParams() {
   return {
     cookieMode: state.cookieMode,
-    cookieBrowser: state.cookieMode === "browser" ? state.cookieBrowser : null,
     cookieFile: state.cookieMode === "file" ? state.cookieFile : null,
   };
 }
@@ -836,7 +1052,7 @@ function linkInputRow(placeholder: string): string {
   if (a && state.screen === "playlist") {
     const count = a.playlistCount ?? a.entries.length;
     statusTag = `<span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>`;
-  } else if (a && state.screen === "mix") {
+  } else if (state.screen === "mix") {
     statusTag = `<span class="tag tag-neutral" style="font-weight:700">MIX · ENDLESS</span>`;
   } else if (a && state.screen === "analyzed") {
     const src = detectSource(a.webpageUrl);
@@ -1186,6 +1402,7 @@ function resetToEmpty() {
   state.analysis = null;
   state.selectedQualityId = "";
   state.tab = "video";
+  state.mixResolving = null;
   render();
 }
 
@@ -1198,6 +1415,7 @@ function backToEmptyKeepingUrl() {
   state.analysis = null;
   state.selectedQualityId = "";
   state.tab = "video";
+  state.mixResolving = null;
   render();
 }
 
@@ -1480,10 +1698,24 @@ async function doAnalyze() {
     startInstall();
     return;
   }
+  // A Mix/Radio link is recognizable from the URL alone (see isLikelyMixUrl) —
+  // jump straight to the chooser instead of burning a whole analyze
+  // round-trip just to learn what the pasted link already told us. The real
+  // analyze only happens once the user picks THIS VIDEO ONLY (on the
+  // stripped, non-mix URL) or FIRST N (mixResolving, below).
+  if (!state.mixResolving && isLikelyMixUrl(state.url)) {
+    cancelInFlightAnalyze();
+    state.mixMode = "single";
+    state.screen = "mix";
+    render();
+    return;
+  }
   cancelInFlightAnalyze(); // editing + resubmitting replaces whatever was running, not queues alongside it
   const id = crypto.randomUUID();
   state.analyzingId = id;
   const urlAtRequest = state.url; // the link as submitted — further edits don't retarget this request
+  const resolvingCapped = state.mixResolving === "capped";
+  state.mixResolving = null;
   state.screen = "analyzing";
   render();
   try {
@@ -1498,8 +1730,16 @@ async function doAnalyze() {
       state.entrySelected = res.entries.map(() => true);
       state.screen = "playlist";
     } else if (res.kind === "mix") {
-      state.mixMode = "single";
-      state.screen = "mix";
+      if (resolvingCapped) {
+        // This analyze was explicitly asked for (FIRST N OF THE MIX) — go
+        // straight to the quality picker with the first N pre-selected
+        // instead of re-showing the chooser the user already answered.
+        state.entrySelected = res.entries.map((_, i) => i < state.mixN);
+        state.screen = "playlist";
+      } else {
+        state.mixMode = "single";
+        state.screen = "mix";
+      }
     } else {
       state.screen = "analyzed";
     }
@@ -1539,6 +1779,7 @@ async function startDownload() {
     id,
     url: a.webpageUrl,
     formatSelector: sel.formatSelector,
+    qualityId: sel.id,
     kind: state.tab,
     audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
     outputDir: state.outputDir,
@@ -1584,6 +1825,7 @@ function startPlaylistDownload() {
     id,
     url: a.webpageUrl,
     formatSelector: sel.formatSelector,
+    qualityId: sel.id,
     kind: state.tab,
     audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
     outputDir: state.outputDir,
@@ -1595,27 +1837,23 @@ function startPlaylistDownload() {
 }
 
 function mixContinue() {
-  const a = state.analysis!;
   // Turn the mix into a normal single-video analyze/download path.
   if (state.mixMode === "single") {
-    // Actually re-analyze just this video: the current analysis is the mix's
-    // (flat-playlist → no thumbnail, generic formats, mix title). Strip the
-    // radio/list/index params off the pasted link and run a fresh analyze so
-    // we get the real clip's title, thumbnail and per-format sizes.
+    // Strip the radio/list/index params off the pasted link and run the
+    // (only) analyze so we get the real clip's title, thumbnail and
+    // per-format sizes — no separate mix analyze ever happened.
     state.url = state.url
       .replace(/[?&]list=[^&]+/g, "")
       .replace(/[?&]index=[^&]+/g, "")
       .replace(/[?&]start_radio=[^&]+/g, "");
     doAnalyze();
   } else {
-    // capped: hand off to the same quality-picker screen a real playlist
-    // uses, pre-selecting just the first N entries — "CONTINUE → PICK
-    // QUALITY" should actually let you pick quality, not silently lock in
-    // 1080p and start downloading.
-    state.entrySelected = a.entries.map((_, i) => i < state.mixN);
+    // capped: this is the first time the mix actually needs to be resolved
+    // (to get real entries to pre-select from) — analyze the original,
+    // unstripped URL and land on the quality picker once it resolves.
+    state.mixResolving = "capped";
     state.selectedQualityId = "";
-    state.screen = "playlist";
-    render();
+    doAnalyze();
   }
 }
 
@@ -1758,8 +1996,11 @@ function loadSettings() {
       state.outputDir = s.outputDir;
       hasSavedOutputDir = true;
     }
-    if (s.cookieMode === "none" || s.cookieMode === "browser" || s.cookieMode === "file") {
-      state.cookieMode = s.cookieMode;
+    // "browser" was a legacy mode (live --cookies-from-browser on every
+    // request, replaced by the one-time import below) — treat it as "none"
+    // for anyone who had it saved from before.
+    if (s.cookieMode === "file") {
+      state.cookieMode = "file";
     }
     if (typeof s.cookieBrowser === "string" && s.cookieBrowser) state.cookieBrowser = s.cookieBrowser;
     if (typeof s.cookieFile === "string") state.cookieFile = s.cookieFile;

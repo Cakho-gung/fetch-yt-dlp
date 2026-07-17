@@ -263,19 +263,403 @@ struct AnalyzeResult {
 }
 
 // Builds the yt-dlp cookie flags for the current settings. `mode` is
-// "browser" | "file" | anything else (treated as no cookies).
-fn cookie_args(mode: Option<&str>, browser: Option<&str>, file: Option<&str>) -> Vec<String> {
+// "file" | anything else (treated as no cookies). Cookies are never read
+// live from a running browser here — see `import_cookies_from_browser`,
+// which snapshots them into this file once so downloads don't each need
+// the browser closed.
+fn cookie_args(mode: Option<&str>, file: Option<&str>) -> Vec<String> {
     match mode {
-        Some("browser") => match browser.filter(|s| !s.is_empty()) {
-            Some(b) => vec!["--cookies-from-browser".into(), b.to_string()],
-            None => vec![],
-        },
         Some("file") => match file.filter(|s| !s.is_empty()) {
             Some(f) => vec!["--cookies".into(), f.to_string()],
             None => vec![],
         },
         _ => vec![],
     }
+}
+
+// ── cookie import from browser ───────────────────────────────────────────
+// Reading cookies straight from a running browser on every yt-dlp call
+// means asking the user to quit their browser before every single
+// download. Instead, `import_cookies_from_browser` snapshots the browser's
+// cookies into a Netscape-format file once (closing/reopening the browser
+// itself if needed), and `cookie_args` "file" mode reads that afterwards —
+// same as if the user had exported it by hand.
+
+/// yt-dlp browser id -> the app's display/process name, used for the UI
+/// label and to find/quit/reopen the running app (macOS).
+fn browser_app_name(browser: &str) -> Option<&'static str> {
+    match browser {
+        "chrome" => Some("Google Chrome"),
+        "edge" => Some("Microsoft Edge"),
+        "firefox" => Some("Firefox"),
+        "brave" => Some("Brave Browser"),
+        "opera" => Some("Opera"),
+        "vivaldi" => Some("Vivaldi"),
+        "safari" => Some("Safari"),
+        _ => None,
+    }
+}
+
+/// yt-dlp browser id -> Windows process image name.
+#[cfg(target_os = "windows")]
+fn browser_process_image(browser: &str) -> Option<&'static str> {
+    match browser {
+        "chrome" => Some("chrome.exe"),
+        "edge" => Some("msedge.exe"),
+        "firefox" => Some("firefox.exe"),
+        "brave" => Some("brave.exe"),
+        "opera" => Some("opera.exe"),
+        "vivaldi" => Some("vivaldi.exe"),
+        _ => None, // Safari doesn't ship on Windows
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pgrep_running(name: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn is_browser_running(browser: &str) -> bool {
+    browser_app_name(browser).map(pgrep_running).unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn is_browser_running(browser: &str) -> bool {
+    let Some(image) = browser_process_image(browser) else {
+        return false;
+    };
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains(&image.to_lowercase()))
+        .unwrap_or(false)
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn is_browser_running(_browser: &str) -> bool {
+    false
+}
+
+/// Asks the browser to quit (a normal graceful quit, same as Cmd+Q /
+/// closing every window) and waits up to 8s for it to actually exit, so
+/// the cookie database file isn't still held open. Best-effort: if it's
+/// still running after the timeout, the extraction step below will just
+/// surface that as a "still in use" error.
+#[cfg(target_os = "macos")]
+fn quit_browser(browser: &str) -> Result<(), String> {
+    let app_name = browser_app_name(browser).ok_or_else(|| format!("Unsupported browser: {browser}"))?;
+    let output = std::process::Command::new("osascript")
+        .args(["-e", &format!("quit app \"{app_name}\"")])
+        .output()
+        .map_err(|e| format!("Could not send quit to {app_name}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("-1743") || stderr.to_lowercase().contains("not authorized") {
+            return Err(format!(
+                "FETCH needs permission to control {app_name}. Grant it in System Settings → Privacy & Security → Automation, then try again."
+            ));
+        }
+        return Err(format!("Could not close {app_name}: {}", stderr.trim()));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && pgrep_running(app_name) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn quit_browser(browser: &str) -> Result<(), String> {
+    if let Some(image) = browser_process_image(browser) {
+        let _ = std::process::Command::new("taskkill").args(["/IM", image]).output();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline && is_browser_running(browser) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn quit_browser(_browser: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reopen_browser(browser: &str) {
+    if let Some(app_name) = browser_app_name(browser) {
+        let _ = std::process::Command::new("open").args(["-a", app_name]).spawn();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reopen_browser(browser: &str) {
+    if let Some(image) = browser_process_image(browser) {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", image]).spawn();
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn reopen_browser(_browser: &str) {}
+
+fn cookies_file_path() -> PathBuf {
+    Path::new(&default_download_dir()).join("cookies.txt")
+}
+
+/// Turns a raw yt-dlp/OS failure into one of the specific, actionable
+/// messages the cookie-import UI shows, instead of a generic traceback.
+fn classify_cookie_extraction_error(stderr: &str, label: &str) -> String {
+    let lower = stderr.to_lowercase();
+    if lower.contains("database is locked") || lower.contains("could not copy") {
+        format!("{label}'s cookie database is still in use. Quit {label} completely and try again.")
+    } else if lower.contains("keychain") || lower.contains("-25293") || lower.contains("-128") || lower.contains("decrypt") {
+        format!(
+            "macOS blocked access to {label}'s saved cookies. Open Keychain Access, find \"{label} Safe Storage\", remove any existing entry for FETCH, then try again and choose \"Always Allow\" when asked."
+        )
+    } else if lower.contains("could not find") || lower.contains("no such file") || lower.contains("does not exist") {
+        format!("Could not find {label}'s cookie data on this computer. Make sure {label} is installed and you've visited at least one site in it.")
+    } else {
+        clean_ytdlp_error(stderr)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CookieImportResult {
+    path: String,
+    cookie_count: usize,
+    warning: Option<String>,
+}
+
+#[tauri::command]
+fn browser_is_running(browser: String) -> bool {
+    is_browser_running(&browser)
+}
+
+/// Snapshots cookies from `browser` into `cookies_file_path()`, closing and
+/// reopening the browser around the extraction if it's currently running.
+/// `probe_url` (the link the user is actually trying to download, when
+/// available) is only used to run yt-dlp against something real and to
+/// check the right site's cookies actually came through — the extraction
+/// itself always grabs every cookie the browser has, not just that site's.
+#[tauri::command]
+async fn import_cookies_from_browser(
+    id: String,
+    jobs: State<'_, Jobs>,
+    cancelled: State<'_, CancelledIds>,
+    browser: String,
+    probe_url: Option<String>,
+) -> Result<CookieImportResult, String> {
+    let label = browser_app_name(&browser)
+        .ok_or_else(|| format!("Unsupported browser: {browser}"))?
+        .to_string();
+
+    let was_running = is_browser_running(&browser);
+    if was_running {
+        // `quit_browser` shells out (osascript on macOS) and can block for a
+        // while if e.g. a macOS Automation permission alert is waiting for a
+        // click — run it off the async runtime and cap how long we'll wait,
+        // so a stuck system dialog can't hang the whole import forever.
+        let browser_for_quit = browser.clone();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || quit_browser(&browser_for_quit)),
+        )
+        .await
+        {
+            Err(_) => {
+                cancelled.0.lock().unwrap().remove(&id);
+                return Err(format!(
+                    "Timed out asking {label} to close — check for a permission popup (Automation access) behind other windows, then try again."
+                ));
+            }
+            Ok(join_result) => {
+                if let Err(e) = join_result.map_err(|e| format!("Internal error closing {label}: {e}")) {
+                    cancelled.0.lock().unwrap().remove(&id);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // Closing the browser can take a while (up to the 15s above); if STOP
+    // was clicked during that stretch, there was no process yet to kill —
+    // bail out now instead of still going on to spawn yt-dlp.
+    let was_cancelled = cancelled.0.lock().unwrap().remove(&id);
+    let result = if was_cancelled {
+        Err("Cancelled.".to_string())
+    } else {
+        extract_cookies(&id, &jobs, &cancelled, &browser, &label, probe_url).await
+    };
+    cancelled.0.lock().unwrap().remove(&id);
+
+    if was_running {
+        reopen_browser(&browser);
+    }
+
+    result
+}
+
+/// Lets the "STOP" button in the import popup kill an in-flight cookie
+/// extraction. Marks `id` cancelled unconditionally (checked at each phase
+/// boundary above/below) and, if a child process is already registered,
+/// kills it immediately too — same mechanism as `cancel_analyze`.
+#[tauri::command]
+fn cancel_cookie_import(jobs: State<'_, Jobs>, cancelled: State<'_, CancelledIds>, id: String) -> Result<(), String> {
+    cancelled.0.lock().unwrap().insert(id.clone());
+    if let Some(mut child) = jobs.0.lock().unwrap().remove(&id) {
+        let _ = child.start_kill();
+    }
+    Ok(())
+}
+
+async fn extract_cookies(
+    id: &str,
+    jobs: &Jobs,
+    cancelled: &CancelledIds,
+    browser: &str,
+    label: &str,
+    probe_url: Option<String>,
+) -> Result<CookieImportResult, String> {
+    let bin = ytdlp()?;
+    let out_path = cookies_file_path();
+    std::fs::create_dir_all(out_path.parent().unwrap())
+        .map_err(|e| format!("Cannot create {}: {e}", out_path.display()))?;
+
+    let url = probe_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "https://www.youtube.com/watch?v=BaW_jenozKc".to_string());
+    let out_path_str = out_path.to_string_lossy().into_owned();
+
+    // `Command::spawn()` itself can block for a long stretch here (the same
+    // macOS re-verification tax as everywhere else yt-dlp runs) with no
+    // process yet to register/kill — run it on a blocking thread so a STOP
+    // click during that window is at least noticed the moment it returns,
+    // rather than only after the extraction that follows.
+    let mut child = tokio::task::spawn_blocking({
+        let bin = bin.clone();
+        let browser = browser.to_string();
+        let out_path_str = out_path_str.clone();
+        let url = url.clone();
+        move || {
+            Command::new(&bin)
+                .args([
+                    "--cookies-from-browser",
+                    &browser,
+                    "--cookies",
+                    &out_path_str,
+                    "--skip-download",
+                    "--simulate",
+                    "--no-warnings",
+                    &url,
+                ])
+                .env("PATH", augmented_path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+        }
+    })
+    .await
+    .map_err(|e| format!("Internal error launching yt-dlp: {e}"))?
+    .map_err(|e| format!("Failed to launch yt-dlp: {e}"))?;
+
+    if cancelled.0.lock().unwrap().contains(id) {
+        let _ = child.start_kill();
+        return Err("Cancelled.".to_string());
+    }
+
+    // Drain both pipes concurrently so a chatty stdout can't block the
+    // child on a full pipe buffer while we're only reading stderr.
+    let mut stderr = child.stderr.take().ok_or("no stderr")?;
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    if let Some(mut stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+        });
+    }
+
+    // Register the child under `id` so `cancel_cookie_import` can steal it
+    // out of the map and kill it — same pattern `analyze()` uses below. If
+    // STOP landed in the narrow gap between the check above and this
+    // insert, catch it here too instead of leaving an unkillable orphan.
+    jobs.0.lock().unwrap().insert(id.to_string(), child);
+    if cancelled.0.lock().unwrap().contains(id) {
+        if let Some(mut child) = jobs.0.lock().unwrap().remove(id) {
+            let _ = child.start_kill();
+        }
+        return Err("Cancelled.".to_string());
+    }
+
+    // yt-dlp launches can be slow to even start on a cold macOS security
+    // scan of the portable binary, and a hidden Keychain prompt can block
+    // it indefinitely. There's a manual STOP button for that, but if
+    // nobody's watching, still cap the wait so this can't hang forever.
+    let stderr_buf = match tokio::time::timeout(std::time::Duration::from_secs(180), stderr_handle).await {
+        Ok(joined) => joined.unwrap_or_default(),
+        Err(_) => {
+            if let Some(mut child) = jobs.0.lock().unwrap().remove(id) {
+                let _ = child.start_kill();
+            }
+            return Err(format!(
+                "Timed out after 3 minutes waiting for yt-dlp to read {label}'s cookies. If a macOS Keychain permission popup is hidden behind another window, approve it and try again."
+            ));
+        }
+    };
+
+    // The child closing its stderr pipe (above) means it's either exited or
+    // been killed — reclaim it from `jobs` to reap the exit status. If it's
+    // no longer there, `cancel_cookie_import` got to it first.
+    let mut child = jobs
+        .0
+        .lock()
+        .unwrap()
+        .remove(id)
+        .ok_or_else(|| "Cancelled.".to_string())?;
+    let _ = child.wait().await;
+
+    // yt-dlp writes the cookiejar out on exit regardless of whether the
+    // probe URL itself resolved, so a real (non-empty) file means the
+    // browser extraction succeeded even if the process exit code didn't.
+    let size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
+        return Err(classify_cookie_extraction_error(&stderr, label));
+    }
+
+    let content = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let cookie_count = content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .count();
+
+    let domain_hint = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .map(|h| h.trim_start_matches("www.").to_string());
+    let warning = match &domain_hint {
+        Some(d) if !d.is_empty() && !content.contains(d.as_str()) => Some(format!(
+            "Imported {cookie_count} cookies from {label}, but none matched {d} — make sure you're logged into that site in {label}."
+        )),
+        _ => None,
+    };
+
+    Ok(CookieImportResult {
+        path: out_path_str,
+        cookie_count,
+        warning,
+    })
 }
 
 // ── commands ─────────────────────────────────────────────────────────────
@@ -310,7 +694,6 @@ async fn analyze(
     jobs: State<'_, Jobs>,
     url: String,
     cookie_mode: Option<String>,
-    cookie_browser: Option<String>,
     cookie_file: Option<String>,
 ) -> Result<AnalyzeResult, String> {
     let url = url.trim().to_string();
@@ -330,11 +713,7 @@ async fn analyze(
         "--playlist-items".into(),
         "1:60".into(),
     ];
-    args.extend(cookie_args(
-        cookie_mode.as_deref(),
-        cookie_browser.as_deref(),
-        cookie_file.as_deref(),
-    ));
+    args.extend(cookie_args(cookie_mode.as_deref(), cookie_file.as_deref()));
     args.push(url.clone());
 
     let mut child = Command::new(&bin)
@@ -853,13 +1232,14 @@ struct DownloadRequest {
     format_selector: String,
     kind: String,          // "video" | "audio"
     audio_format: Option<String>, // "mp3" | "m4a" when kind == audio
+    #[serde(default)]
+    quality_id: String,    // the picked QualityOption.id (e.g. "1080p", "original") — stamped into the filename so re-downloading at a different quality doesn't collide with an earlier one
     output_dir: String,
     write_thumbnail: bool, // save the thumbnail as its own image file
     write_description: bool, // save the description to a .description text file
     write_subs: bool,      // save subtitles as their own .srt file
     playlist_items: Option<String>, // e.g. "1,3,4-6" for playlist selections
     cookie_mode: Option<String>,
-    cookie_browser: Option<String>,
     cookie_file: Option<String>,
 }
 
@@ -893,6 +1273,32 @@ struct ErrorPayload {
 #[derive(Default)]
 struct Jobs(Mutex<HashMap<String, Child>>);
 
+/// Ids the user has asked to cancel via `cancel_cookie_import`, checked at
+/// every phase boundary of `import_cookies_from_browser`. Needed because the
+/// yt-dlp child isn't registered in `Jobs` (and so isn't killable) for the
+/// first stretch of the operation — closing the browser, and even just
+/// `Command::spawn()` itself, can each block for many seconds (macOS
+/// re-verifying the portable binary) before there's any process to kill.
+#[derive(Default)]
+struct CancelledIds(Mutex<std::collections::HashSet<String>>);
+
+/// Turns a picked QualityOption.id into the short, filename-safe label
+/// stamped in front of the title (e.g. "1080p - My Video.mp4"). Keeps
+/// same-day re-downloads at a different quality from colliding with an
+/// earlier file instead of overwriting it.
+fn quality_stamp(id: &str) -> String {
+    match id {
+        "" => String::new(),
+        "best" => "Best".into(),
+        "original" => "Original".into(),
+        "m4a" => "M4A".into(),
+        _ => match id.strip_prefix("mp3-") {
+            Some(kbps) => format!("MP3 {kbps}"),
+            None => id.into(), // "1080p", "720p", "2160p", ... already filename-safe
+        },
+    }
+}
+
 #[tauri::command]
 async fn download(
     app: AppHandle,
@@ -906,13 +1312,23 @@ async fn download(
     std::fs::create_dir_all(&req.output_dir)
         .map_err(|e| format!("Cannot create download folder: {e}"))?;
 
-    // Every video gets its own folder, named with today's date so the
-    // download dir sorts cleanly, e.g. "260715 - My Video". For playlists
+    // Every video gets its own folder, keyed only on its title (no date
+    // prefix) so re-downloading the same video later reuses the same folder
+    // instead of spawning a new one per day — the OS's own "date modified"
+    // already tells you when a folder was last touched. For playlists
     // yt-dlp fills in %(title)s per entry, so each video still lands in its
-    // own folder rather than being pooled together.
-    let today = Local::now().format("%y%m%d");
+    // own folder rather than being pooled together. The quality is stamped
+    // onto the filename itself so re-downloading the same video at a
+    // different quality lands next to the earlier file instead of colliding
+    // with it.
+    let stamp = quality_stamp(&req.quality_id);
+    let filename = if stamp.is_empty() {
+        "%(title)s.%(ext)s".to_string()
+    } else {
+        format!("{stamp} - %(title)s.%(ext)s")
+    };
     let out_tmpl = format!(
-        "{}/{today} - %(title)s/%(title)s.%(ext)s",
+        "{}/%(title)s/{filename}",
         req.output_dir.trim_end_matches('/')
     );
 
@@ -922,6 +1338,9 @@ async fn download(
         req.format_selector.clone(),
         "-o".into(),
         out_tmpl,
+        // Re-downloading the same title/quality combo already on disk is
+        // skipped rather than overwritten.
+        "--no-overwrites".into(),
         "--newline".into(),
         "--no-color".into(),
         "--no-warnings".into(),
@@ -934,11 +1353,7 @@ async fn download(
         "--print".into(),
         "after_move:FETCHFILE|%(filepath)s".into(),
     ];
-    args.extend(cookie_args(
-        req.cookie_mode.as_deref(),
-        req.cookie_browser.as_deref(),
-        req.cookie_file.as_deref(),
-    ));
+    args.extend(cookie_args(req.cookie_mode.as_deref(), req.cookie_file.as_deref()));
 
     if req.kind == "audio" {
         let af = req.audio_format.as_deref().unwrap_or("original");
@@ -1167,11 +1582,16 @@ async fn download_spotify(
         .map_err(|e| format!("Cannot create download folder: {e}"))?;
 
     let started = SystemTime::now();
-    // Same "{date} - title/title.ext" folder convention as the yt-dlp path,
-    // but with spotDL's own template placeholders ({title}, {output-ext}).
-    let today = Local::now().format("%y%m%d");
+    // Same "title/quality - title.ext" convention as the yt-dlp path, but
+    // with spotDL's own template placeholders ({title}, {output-ext}).
+    let stamp = quality_stamp(&req.quality_id);
+    let filename = if stamp.is_empty() {
+        "{title}.{output-ext}".to_string()
+    } else {
+        format!("{stamp} - {{title}}.{{output-ext}}")
+    };
     let out_tmpl = format!(
-        "{}/{today} - {{title}}/{{title}}.{{output-ext}}",
+        "{}/{{title}}/{filename}",
         req.output_dir.trim_end_matches('/')
     );
 
@@ -2234,9 +2654,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Jobs::default())
+        .manage(CancelledIds::default())
         .invoke_handler(tauri::generate_handler![
             check_binaries,
             default_download_dir,
+            browser_is_running,
+            import_cookies_from_browser,
+            cancel_cookie_import,
             analyze,
             cancel_analyze,
             download,
