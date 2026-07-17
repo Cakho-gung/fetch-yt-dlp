@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { checkForAppUpdate } from "./updater";
 
 // ── Lucide SVG icons (inline — no CDN/npm needed) ─────────────────────────
 // Each returns an <svg> string. size defaults to 16. stroke defaults to 2.
@@ -2064,6 +2065,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (state.binaries?.ytDlp && state.binaries?.ffmpeg) {
     checkForUpdates(); // fire-and-forget; toasts only if something's outdated
   }
+  // Check for FETCH app updates (auto-update via Tauri updater plugin)
+  checkForAppUpdate();
 
   // Dev-only hook: lets the UI states be driven for visual review without a
   // live yt-dlp backend. Stripped from production builds.

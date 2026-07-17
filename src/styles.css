@@ -1256,3 +1256,42 @@ body,
 #app[data-theme="dark"] .preview .dur {
   color: var(--color-bg);
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   App updater modal
+   ══════════════════════════════════════════════════════════════════════ */
+.update-modal {
+  width: min(380px, calc(100vw - var(--space-8)));
+}
+
+.update-icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--color-accent);
+  color: var(--color-bg);
+}
+
+.update-icon-error {
+  background: var(--color-neutral-800);
+}
+
+.update-ver-label {
+  font: 600 11px var(--font-heading);
+  letter-spacing: .08em;
+  color: color-mix(in srgb, var(--color-text) var(--muted-alpha), transparent);
+}
+
+/* spinner */
+@keyframes updater-spin {
+  to { transform: rotate(360deg); }
+}
+.update-icon.spin svg {
+  animation: updater-spin .8s linear infinite;
+}
+
+#app[data-theme="dark"] .update-icon {
+  color: var(--color-bg);
+}
