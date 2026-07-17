@@ -14,6 +14,38 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+// ── child-process spawning ───────────────────────────────────────────────
+// Every command-line tool we run (yt-dlp, ffmpeg, curl, tar, tasklist, …) is
+// a console program, and on Windows spawning one without CREATE_NO_WINDOW
+// pops a visible console window that flashes on screen. We funnel every spawn
+// through these two helpers so the flag is applied in exactly one place; on
+// macOS/Linux they're plain `Command::new`.
+
+/// Windows `CREATE_NO_WINDOW` process-creation flag.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Builds an async (tokio) `Command` with no console window on Windows.
+fn command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// Builds a blocking `std::process::Command` with no console window on Windows.
+fn std_command<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 // ── binary resolution ────────────────────────────────────────────────────
 // GUI apps on macOS launch with a bare PATH that misses Homebrew, so we probe
 // the usual install dirs ourselves and hand yt-dlp an augmented PATH so it can
@@ -61,54 +93,74 @@ fn dirs_home() -> Option<PathBuf> {
 /// spawned before the install, e.g. a dev-mode terminal) to reload it — so
 /// a self-relaunch that just inherits our own env won't see new tools
 /// either. Read the live value straight from the registry instead.
+/// Expands `%VAR%` references in a registry `REG_EXPAND_SZ` string using the
+/// current process environment. Unknown or unterminated names are left as-is.
+#[cfg(windows)]
+fn expand_env_vars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let mut name = String::new();
+        let mut closed = false;
+        for c2 in chars.by_ref() {
+            if c2 == '%' {
+                closed = true;
+                break;
+            }
+            name.push(c2);
+        }
+        match (closed, std::env::var(&name)) {
+            (true, Ok(val)) => out.push_str(&val),
+            (true, Err(_)) => {
+                out.push('%');
+                out.push_str(&name);
+                out.push('%');
+            }
+            (false, _) => {
+                out.push('%');
+                out.push_str(&name);
+            }
+        }
+    }
+    out
+}
+
+/// The Downloads known folder, honoring a user relocation (Explorer →
+/// Downloads → Properties → Location → Move). Windows keeps the live path
+/// under "User Shell Folders", keyed by the Downloads folder GUID and stored
+/// as a `REG_EXPAND_SZ` (typically `%USERPROFILE%\Downloads`), so we read and
+/// expand it ourselves. Returns `None` when the value is missing so callers
+/// fall back to the fixed `<home>\Downloads`.
+#[cfg(windows)]
+fn windows_downloads_dir() -> Option<PathBuf> {
+    const DOWNLOADS_GUID: &str = "{374DE290-123F-4565-9164-39C4925E467B}";
+    let key = winreg::HKCU
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+        .ok()?;
+    let raw: String = key.get_value(DOWNLOADS_GUID).ok()?;
+    let expanded = expand_env_vars(raw.trim());
+    (!expanded.is_empty()).then(|| PathBuf::from(expanded))
+}
+
 #[cfg(windows)]
 fn live_path_dirs() -> Vec<PathBuf> {
     fn read(key: &winreg::RegKey, subkey: &str) -> Option<String> {
         key.open_subkey(subkey).ok()?.get_value::<String, _>("Path").ok()
     }
 
-    fn expand(raw: &str) -> String {
-        let mut out = String::with_capacity(raw.len());
-        let mut chars = raw.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                out.push(c);
-                continue;
-            }
-            let mut name = String::new();
-            let mut closed = false;
-            for c2 in chars.by_ref() {
-                if c2 == '%' {
-                    closed = true;
-                    break;
-                }
-                name.push(c2);
-            }
-            match (closed, std::env::var(&name)) {
-                (true, Ok(val)) => out.push_str(&val),
-                (true, Err(_)) => {
-                    out.push('%');
-                    out.push_str(&name);
-                    out.push('%');
-                }
-                (false, _) => {
-                    out.push('%');
-                    out.push_str(&name);
-                }
-            }
-        }
-        out
-    }
-
     let mut dirs = Vec::new();
     if let Some(raw) = read(winreg::HKCU, "Environment") {
-        dirs.extend(std::env::split_paths(&expand(&raw)));
+        dirs.extend(std::env::split_paths(&expand_env_vars(&raw)));
     }
     if let Some(raw) = read(
         winreg::HKLM,
         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
     ) {
-        dirs.extend(std::env::split_paths(&expand(&raw)));
+        dirs.extend(std::env::split_paths(&expand_env_vars(&raw)));
     }
     if dirs.is_empty() {
         if let Some(path) = std::env::var_os("PATH") {
@@ -316,7 +368,7 @@ fn browser_process_image(browser: &str) -> Option<&'static str> {
 
 #[cfg(target_os = "macos")]
 fn pgrep_running(name: &str) -> bool {
-    std::process::Command::new("pgrep")
+    std_command("pgrep")
         .args(["-x", name])
         .output()
         .map(|o| o.status.success())
@@ -333,7 +385,7 @@ fn is_browser_running(browser: &str) -> bool {
     let Some(image) = browser_process_image(browser) else {
         return false;
     };
-    std::process::Command::new("tasklist")
+    std_command("tasklist")
         .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains(&image.to_lowercase()))
@@ -353,7 +405,7 @@ fn is_browser_running(_browser: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn quit_browser(browser: &str) -> Result<(), String> {
     let app_name = browser_app_name(browser).ok_or_else(|| format!("Unsupported browser: {browser}"))?;
-    let output = std::process::Command::new("osascript")
+    let output = std_command("osascript")
         .args(["-e", &format!("quit app \"{app_name}\"")])
         .output()
         .map_err(|e| format!("Could not send quit to {app_name}: {e}"))?;
@@ -376,7 +428,7 @@ fn quit_browser(browser: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn quit_browser(browser: &str) -> Result<(), String> {
     if let Some(image) = browser_process_image(browser) {
-        let _ = std::process::Command::new("taskkill").args(["/IM", image]).output();
+        let _ = std_command("taskkill").args(["/IM", image]).output();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         while std::time::Instant::now() < deadline && is_browser_running(browser) {
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -393,14 +445,14 @@ fn quit_browser(_browser: &str) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn reopen_browser(browser: &str) {
     if let Some(app_name) = browser_app_name(browser) {
-        let _ = std::process::Command::new("open").args(["-a", app_name]).spawn();
+        let _ = std_command("open").args(["-a", app_name]).spawn();
     }
 }
 
 #[cfg(target_os = "windows")]
 fn reopen_browser(browser: &str) {
     if let Some(image) = browser_process_image(browser) {
-        let _ = std::process::Command::new("cmd").args(["/C", "start", "", image]).spawn();
+        let _ = std_command("cmd").args(["/C", "start", "", image]).spawn();
     }
 }
 
@@ -547,7 +599,7 @@ async fn extract_cookies(
         let out_path_str = out_path_str.clone();
         let url = url.clone();
         move || {
-            Command::new(&bin)
+            command(&bin)
                 .args([
                     "--cookies-from-browser",
                     &browser,
@@ -681,6 +733,12 @@ fn check_binaries() -> Binaries {
 
 #[tauri::command]
 fn default_download_dir() -> String {
+    // On Windows, follow the user's actual (possibly relocated) Downloads
+    // known folder rather than assuming `<home>\Downloads`.
+    #[cfg(windows)]
+    if let Some(dl) = windows_downloads_dir() {
+        return dl.join("Fetch").to_string_lossy().into_owned();
+    }
     let base = dirs_home().unwrap_or_else(|| PathBuf::from("."));
     base.join("Downloads").join("Fetch").to_string_lossy().into_owned()
 }
@@ -716,7 +774,7 @@ async fn analyze(
     args.extend(cookie_args(cookie_mode.as_deref(), cookie_file.as_deref()));
     args.push(url.clone());
 
-    let mut child = Command::new(&bin)
+    let mut child = command(&bin)
         .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
@@ -817,7 +875,7 @@ async fn analyze_spotify(
         tmp.to_string_lossy().into_owned(),
     ];
 
-    let mut child = Command::new(&bin)
+    let mut child = command(&bin)
         .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
@@ -1403,7 +1461,7 @@ async fn download(
         args.push("--no-playlist".into());
     }
 
-    let mut child = Command::new(&bin)
+    let mut child = command(&bin)
         .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
@@ -1647,7 +1705,7 @@ async fn download_spotify(
         args.push("--generate-lrc".into());
     }
 
-    let mut child = Command::new(&bin)
+    let mut child = command(&bin)
         .args(&args)
         .env("PATH", augmented_path())
         .stdout(Stdio::piped())
@@ -1830,7 +1888,7 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
     let p = Path::new(&path);
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("open");
+        let mut cmd = std_command("open");
         if p.is_file() {
             cmd.arg("-R");
         }
@@ -1839,18 +1897,21 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // Explorer has its own command-line parser that ignores the usual
+        // argv quoting rules: `/select,` must be glued to the path in a
+        // single token (a space after the comma makes Explorer discard the
+        // target and fall back to opening Documents), and the path must use
+        // backslashes. Build the command line verbatim with `raw_arg` so Rust
+        // doesn't re-split it into a form Explorer mis-parses.
+        let win_path = path.replace('/', "\\");
+        let mut cmd = std_command("explorer");
         if p.is_file() {
-            std::process::Command::new("explorer")
-                .arg("/select,")
-                .arg(&path)
-                .spawn()
-                .map_err(|e| e.to_string())?;
+            cmd.raw_arg(format!("/select,\"{win_path}\""));
         } else {
-            std::process::Command::new("explorer")
-                .arg(&path)
-                .spawn()
-                .map_err(|e| e.to_string())?;
+            cmd.raw_arg(format!("\"{win_path}\""));
         }
+        cmd.spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -1859,7 +1920,7 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
         } else {
             p.to_path_buf()
         };
-        std::process::Command::new("xdg-open")
+        std_command("xdg-open")
             .arg(target)
             .spawn()
             .map_err(|e| e.to_string())?;
@@ -1962,7 +2023,7 @@ async fn brew_cmd(app: &AppHandle, subcommand: &str, tools: &[String]) -> Result
     )
     .ok();
 
-    let mut cmd = Command::new(&brew);
+    let mut cmd = command(&brew);
     cmd.args(&args)
         .env("PATH", augmented_path())
         // brew refuses to run if it thinks it's non-interactive in odd ways;
@@ -2023,7 +2084,7 @@ async fn run_streamed_command(app: &AppHandle, mut cmd: Command, fail_msg: &str)
 async fn mac_curl_download(url: &str, dest: &Path) -> Result<(), String> {
     let curl = resolve_binary("curl").ok_or("curl not found. It ships with macOS — check it hasn't been removed.")?;
     let tmp = dest.with_extension("part");
-    let status = Command::new(&curl)
+    let status = command(&curl)
         // --connect-timeout bounds the initial connection; --speed-time/
         // --speed-limit aborts a connection that stalls mid-transfer —
         // without these a dropped/blocked connection can hang indefinitely.
@@ -2048,7 +2109,7 @@ async fn mac_curl_download(url: &str, dest: &Path) -> Result<(), String> {
 /// 86) apart from anything else and react differently (e.g. fall back to pip).
 #[cfg(target_os = "macos")]
 async fn check_mac_exec(dest: &Path) -> std::io::Result<()> {
-    Command::new(dest).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map(|_| ())
+    command(dest).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map(|_| ())
 }
 
 /// Parses "Python 3.9.6" (the format `python3 --version` prints to stdout
@@ -2081,7 +2142,7 @@ async fn pip_install_spotdl(app: &AppHandle) -> Result<PathBuf, String> {
     // the same way: get (or upgrade to) a real 3.10+ via Homebrew.
     let usable = match &python {
         Some(p) => {
-            let ver_str = Command::new(p)
+            let ver_str = command(p)
                 .arg("--version")
                 .output()
                 .await
@@ -2100,7 +2161,7 @@ async fn pip_install_spotdl(app: &AppHandle) -> Result<PathBuf, String> {
              then try again.",
         )?;
         app.emit("install-log", "Installing a newer Python via Homebrew (spotDL needs 3.10+)…").ok();
-        let mut cmd = Command::new(&brew);
+        let mut cmd = command(&brew);
         cmd.args(["install", "python3"]).env("PATH", augmented_path()).env("HOMEBREW_NO_AUTO_UPDATE", "1");
         run_streamed_command(app, cmd, "Homebrew couldn't install python3. See the log above.").await?;
         python = resolve_binary("python3");
@@ -2115,11 +2176,11 @@ async fn pip_install_spotdl(app: &AppHandle) -> Result<PathBuf, String> {
     // dependency tree self-contained, the same way yt-dlp/ffmpeg are already
     // sandboxed there instead of touching the system Python.
     let venv_dir = portable_bin_dir().join("spotdl-venv");
-    let mut cmd = Command::new(&python);
+    let mut cmd = command(&python);
     cmd.args(["-m", "venv", "--clear"]).arg(&venv_dir);
     run_streamed_command(app, cmd, "Couldn't create a Python environment for spotDL. See the log above.").await?;
 
-    let mut cmd = Command::new(venv_dir.join("bin").join("pip"));
+    let mut cmd = command(venv_dir.join("bin").join("pip"));
     cmd.args(["install", "--upgrade", "spotdl"]);
     run_streamed_command(
         app,
@@ -2246,7 +2307,7 @@ async fn curl_download(url: &str, dest: &Path) -> Result<(), String> {
         .or_else(|| resolve_binary("curl"))
         .ok_or("curl.exe not found. It ships with Windows 10/11 — check it hasn't been removed.")?;
     let tmp = dest.with_extension("part");
-    let status = Command::new(&curl)
+    let status = command(&curl)
         .args(["-L", "-sS", "--fail", "--connect-timeout", "15", "--speed-time", "30", "--speed-limit", "1000", "-o"])
         .arg(&tmp)
         .arg(url)
@@ -2315,7 +2376,7 @@ async fn install_tools_portable(app: &AppHandle, tools: &[String]) -> Result<(),
                 // Must be the bsdtar in System32 — GNU tar (e.g. Git for Windows') can't read .zip.
                 let tar = system32_bin("tar")
                     .ok_or("tar.exe not found in System32. It ships with Windows 10/11 — check it hasn't been removed.")?;
-                let status = Command::new(&tar)
+                let status = command(&tar)
                     .arg("-xf")
                     .arg(&zip_path)
                     .arg("-C")
@@ -2402,7 +2463,7 @@ fn tool_source(path: &Path) -> &'static str {
 /// GET `url` via the system `curl` and return the response body as text.
 async fn curl_get(url: &str) -> Result<String, String> {
     let curl = resolve_binary("curl").ok_or("curl not found.")?;
-    let output = Command::new(&curl)
+    let output = command(&curl)
         .args(["-L", "-sS", "--fail", "--connect-timeout", "10", "--max-time", "15", "-H", "User-Agent: fetch-app"])
         .arg(url)
         .env("PATH", augmented_path())
@@ -2496,7 +2557,7 @@ async fn latest_ffmpeg_version() -> Result<String, String> {
 }
 
 async fn binary_version_output(path: &Path, arg: &str) -> Option<String> {
-    let out = Command::new(path).arg(arg).output().await.ok()?;
+    let out = command(path).arg(arg).output().await.ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.trim().is_empty() {
         Some(stdout.into_owned())

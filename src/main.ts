@@ -1686,6 +1686,7 @@ async function pickDir() {
   const picked = await openDialog({ directory: true, defaultPath: state.outputDir });
   if (typeof picked === "string") {
     state.outputDir = picked;
+    dirPinned = true;
     persistSettings();
     render();
   }
@@ -1980,6 +1981,10 @@ function persistSettings() {
       "fetch.settings",
       JSON.stringify({
         outputDir: state.outputDir,
+        // Only an explicit folder pick "pins" outputDir; otherwise it's just
+        // the machine-derived default and we let the backend recompute it each
+        // launch, so a relocated Downloads folder is always tracked.
+        dirPinned,
         cookieMode: state.cookieMode,
         cookieBrowser: state.cookieBrowser,
         cookieFile: state.cookieFile,
@@ -1988,14 +1993,20 @@ function persistSettings() {
   } catch { }
 }
 let hasSavedOutputDir = false;
+// True only when the user explicitly picked a download folder. Legacy saved
+// settings (before this flag existed) lack it, so they're treated as unpinned
+// and fall through to the live default — auto-migrating anyone whose stored
+// outputDir was just the old machine default.
+let dirPinned = false;
 function loadSettings() {
   try {
     const raw = localStorage.getItem("fetch.settings");
     if (!raw) return;
     const s = JSON.parse(raw);
-    if (typeof s.outputDir === "string" && s.outputDir) {
+    if (s.dirPinned === true && typeof s.outputDir === "string" && s.outputDir) {
       state.outputDir = s.outputDir;
       hasSavedOutputDir = true;
+      dirPinned = true;
     }
     // "browser" was a legacy mode (live --cookies-from-browser on every
     // request, replaced by the one-time import below) — treat it as "none"
