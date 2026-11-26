@@ -3,233 +3,60 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { checkForAppUpdate } from "./updater";
-
-// ── Lucide SVG icons (inline — no CDN/npm needed) ─────────────────────────
-// Each returns an <svg> string. size defaults to 16. stroke defaults to 2.
-function svg(path: string, size = 16, sw = 2): string {
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;flex-shrink:0">${path}</svg>`;
-}
-// icon path constants (Lucide)
-const IC_X           = `<path d="M18 6 6 18M6 6l12 12"/>`;
-const IC_DOWNLOAD    = `<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>`;
-const IC_CHECK       = `<path d="M20 6 9 17l-5-5"/>`;
-const IC_ALERT       = `<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>`;
-const IC_ARROW_UP    = `<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>`;
-const IC_FOLDER      = `<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>`;
-const IC_LOADER      = `<path d="M21 12a9 9 0 1 1-6.219-8.56"/>`;
-const IC_REFRESH     = `<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>`;
-const IC_SETTINGS    = `<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>`;
-
-
-// ── types (mirror the Rust structs) ───────────────────────────────────────
-interface Binaries {
-  ytDlp: boolean;
-  ffmpeg: boolean;
-  spotdl: boolean;
-  ytDlpPath?: string;
-  ffmpegPath?: string;
-  spotdlPath?: string;
-}
-interface Installers {
-  available: boolean;
-  manager: string; // "mac" | "fetch" | ""
-  platform: string;
-  brewAvailable: boolean;
-}
-interface ToolUpdate {
-  current?: string;
-  latest?: string;
-  updateAvailable: boolean;
-  source: string; // "portable" | "brew" | "other" | ""
-}
-interface UpdateCheck {
-  ytDlp: ToolUpdate;
-  ffmpeg: ToolUpdate;
-  spotdl: ToolUpdate;
-}
-interface CookieImportResult {
-  path: string;
-  cookieCount: number;
-  warning?: string;
-}
-interface QualityOption {
-  id: string;
-  label: string;
-  height?: number;
-  approxBytes?: number;
-  formatSelector: string;
-  kind: "video" | "audio";
-}
-interface PlaylistEntry {
-  index: number;
-  title: string;
-  durationSeconds?: number;
-  thumbnail?: string;
-  url?: string; // Spotify only: the individual track URL
-}
-interface AnalyzeResult {
-  kind: "video" | "playlist" | "mix";
-  webpageUrl: string;
-  title: string;
-  uploader?: string;
-  durationSeconds?: number;
-  viewCount?: number;
-  thumbnail?: string;
-  extractor: string;
-  videoOptions: QualityOption[];
-  audioOptions: QualityOption[];
-  entries: PlaylistEntry[];
-  playlistCount?: number;
-}
-interface HistoryItem {
-  title: string;
-  ext: string;
-  sizeLabel: string;
-  path?: string;
-  at: number;
-}
-
-type Screen =
-  | "empty"
-  | "analyzing"
-  | "analyzed"
-  | "playlist"
-  | "mix"
-  | "downloading"
-  | "installing";
-
-// ── app state ──────────────────────────────────────────────────────────────
-const state = {
-  screen: "empty" as Screen,
-  binaries: null as Binaries | null,
-  installers: null as Installers | null,
-  installLog: [] as string[],
-  installDone: false,
-  installError: "",
-  // What the "installing" screen is currently showing: the label(s) to
-  // display, whether it's a version update (vs. first-time install of a
-  // missing tool — different title/copy, and doesn't force a restart), and
-  // which screen to return to once it's done (updates happen mid-session,
-  // so unlike a first-time install we can't just dump the user back to
-  // "empty" — they may have a link/analysis in progress).
-  installTargets: [] as string[],
-  installIsUpdate: false,
-  installReturnScreen: null as Screen | null,
-  updateCheck: null as UpdateCheck | null,
-  checkingUpdates: false,
-  outputDir: "",
-  url: "",
-  analyzingId: null as string | null,
-  analysis: null as AnalyzeResult | null,
-  tab: "video" as "video" | "audio",
-  selectedQualityId: "",
-  writeThumbnail: false,
-  writeDescription: false,
-  writeSubs: false,
-  job: null as null | {
-    id: string;
-    percent: number;
-    speed: string;
-    eta: string;
-    stage: string;
-    name: string;
-    sizeLabel: string;
-  },
-  history: [] as HistoryItem[],
-  // playlist selection
-  entrySelected: [] as boolean[],
-  mixMode: "single" as "single" | "capped",
-  mixN: 10,
-  // Set right before an analyze() call that's meant to actually resolve a
-  // mix (as opposed to the URL-pattern short-circuit in doAnalyze() that
-  // shows the chooser with zero backend calls) — tells the completion
-  // handler what to do once the real entries come back.
-  mixResolving: null as "capped" | null,
-  // settings
-  settingsOpen: false,
-  cookieMode: "none" as "none" | "file",
-  cookieBrowser: "chrome", // last browser picked for "Import from browser"
-  cookieFile: "",
-  cookieImport: { state: "idle", message: "" } as CookieImportState,
-  cookieImportModal: { open: false, browser: "chrome", id: null as string | null },
-  cookieImportStopRequested: false,
-};
-
-type CookieImportState = {
-  state: "idle" | "busy" | "done" | "error";
-  message: string;
-};
-
-const COOKIE_BROWSERS = ["chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari"];
-
-// ── helpers ──────────────────────────────────────────────────────────────
-const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
-  document.querySelector<T>(sel);
-const body = () => $("#body")!;
-const esc = (s: string) =>
-  s.replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!)
-  );
-
-function fmtBytes(b?: number): string {
-  if (!b || b <= 0) return "— MB";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let n = b;
-  while (n >= 1024 && i < u.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n < 10 && i > 1 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
-}
-function fmtDuration(s?: number): string {
-  if (s == null) return "";
-  const t = Math.round(s);
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const sec = t % 60;
-  const pad = (x: number) => String(x).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
-}
-function fmtViews(v?: number): string {
-  if (v == null) return "";
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M views`;
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K views`;
-  return `${v} views`;
-}
-function detectSource(url: string): string {
-  try {
-    const h = new URL(url).hostname.replace(/^www\./, "");
-    if (h.includes("youtu")) return "YOUTUBE";
-    if (h.includes("spotify")) return "SPOTIFY";
-    if (h.includes("soundcloud")) return "SOUNDCLOUD";
-    if (h.includes("tiktok")) return "TIKTOK";
-    if (h.includes("vimeo")) return "VIMEO";
-    if (h.includes("twitter") || h.includes("x.com")) return "X";
-    return h.split(".")[0].toUpperCase();
-  } catch {
-    return "LINK";
-  }
-}
-const isLikelyUrl = (s: string) => /^https?:\/\/\S+\.\S+/.test(s.trim());
-// Mirrors the `is_mix` check in src-tauri/src/lib.rs (playlist_id.starts_with("RD")
-// || url.contains("list=RD")) — a YouTube auto-generated Mix/Radio always carries
-// a "list=RD…" param, so this is knowable straight from the pasted link, no
-// analyze round-trip required.
-const isLikelyMixUrl = (s: string) => /[?&]list=RD/.test(s);
-
-// A user-facing file extension for an audio tier id ("mp3-320" → "mp3",
-// "m4a" → "m4a"). "original" keeps the source codec, whose real extension is
-// only known once the file lands, so it's a placeholder until then.
-function audioExtLabel(id: string): string {
-  if (id.startsWith("mp3")) return "mp3";
-  if (id === "m4a") return "m4a";
-  return "audio";
-}
-
-// registration-mark corners for a .blueprint element
-const corners = `<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>`;
+import type {
+  AnalyzeResult,
+  Binaries,
+  CookieImportResult,
+  HelpTopic,
+  HistoryItem,
+  Installers,
+  QuickMeta,
+  Screen,
+  ToolUpdate,
+  UpdateCheck,
+} from "./types";
+import {
+  IC_ALERT,
+  IC_ARROW_UP,
+  IC_CHECK,
+  IC_DOWNLOAD,
+  IC_FOLDER,
+  IC_LOADER,
+  IC_REFRESH,
+  IC_SETTINGS,
+  IC_X,
+  corners,
+  svg,
+} from "./icons";
+import {
+  $,
+  BREW_INSTALL_CMD,
+  COOKIE_BROWSERS,
+  audioExtLabel,
+  body,
+  detectSource,
+  esc,
+  fmtBytes,
+  fmtDuration,
+  fmtViews,
+  isCookieError,
+  isFormatUnavailableError,
+  isHomebrewMissingError,
+  isLikelyMixUrl,
+  isLikelyUrl,
+  relTime,
+} from "./utils";
+import {
+  canAnalyze,
+  cookieParams,
+  currentSelection,
+  loadHistory,
+  loadSettings,
+  missingTools,
+  persistHistory,
+  persistSettings,
+  state,
+} from "./state";
 
 // ── rendering ────────────────────────────────────────────────────────────
 // tracks the last screen the entrance animation actually played for, so
@@ -244,6 +71,10 @@ function render() {
   // it's all one innerHTML swap — save + restore its scroll position across
   // that so ticking a checkbox doesn't jump the list back to the top.
   const listScroll = el.querySelector<HTMLElement>(".playlist-rows")?.scrollTop;
+  const urlEl = document.getElementById("urlInput") as HTMLInputElement | null;
+  const urlHadFocus = !!urlEl && document.activeElement === urlEl;
+  const urlSelStart = urlEl?.selectionStart ?? null;
+  const urlSelEnd = urlEl?.selectionEnd ?? null;
   switch (state.screen) {
     case "empty":
     case "analyzing":
@@ -267,6 +98,13 @@ function render() {
   }
   wireEvents();
   renderSettingsModal();
+  if (urlHadFocus) {
+    const n = document.getElementById("urlInput") as HTMLInputElement | null;
+    if (n) {
+      n.focus();
+      if (urlSelStart !== null && urlSelEnd !== null) n.setSelectionRange(urlSelStart, urlSelEnd);
+    }
+  }
   if (listScroll) {
     const list = el.querySelector<HTMLElement>(".playlist-rows");
     if (list) list.scrollTop = listScroll;
@@ -297,54 +135,18 @@ function updateStatusTag() {
   }
 }
 
-// Which tools a given link needs: Spotify goes through spotDL (+ ffmpeg to
-// transcode), everything else through yt-dlp (+ ffmpeg to mux/extract). An
-// empty box defaults to the yt-dlp set so first-run setup still prompts for
-// the common case.
-function requiredTools(url: string): ("yt-dlp" | "ffmpeg" | "spotdl")[] {
-  return detectSource(url) === "SPOTIFY" ? ["spotdl", "ffmpeg"] : ["yt-dlp", "ffmpeg"];
-}
-
-function missingTools(): string[] {
-  const b = state.binaries;
-  if (!b) return [];
-  const have: Record<string, boolean> = {
-    "yt-dlp": b.ytDlp,
-    ffmpeg: b.ffmpeg,
-    spotdl: !!b.spotdl,
-  };
-  return requiredTools(state.url).filter((t) => !have[t]);
-}
-
-function canAnalyze(): boolean {
-  return !!state.binaries && missingTools().length === 0;
-}
-
 function missingBinariesWarn(): string {
   const need = missingTools();
   if (need.length === 0) return "";
   const canAuto = !!state.installers?.available;
   const mgr = state.installers?.manager || "brew";
   const needLabel = need.join(" + ").toUpperCase();
-  // On macOS ffmpeg is the only tool that goes through brew; yt-dlp and
-  // spotDL download as portable binaries. On Windows ("fetch") everything is
-  // portable.
-  const brewPart = mgr === "mac" && need.includes("ffmpeg");
-  // Homebrew itself missing is a distinct, upfront-known case (checked once
-  // at startup) — installing would just fail on the ffmpeg step, so point at
-  // the Homebrew setup flow directly instead of trying and failing.
-  const needsHomebrew = brewPart && !state.installers?.brewAvailable;
 
   let label: string;
   let desc: string;
-  if (mgr === "fetch") {
+  if (mgr === "fetch" || mgr === "mac") {
     label = `${svg(IC_DOWNLOAD, 13)} DOWNLOAD ${needLabel}`;
-    desc = `FETCH downloads portable copies into its own folder — no system install, no PATH changes.${need.includes("ffmpeg") ? " ffmpeg can take a few minutes." : ""}`;
-  } else if (mgr === "mac") {
-    label = `${svg(IC_DOWNLOAD, 13)} INSTALL ${needLabel}`;
-    desc = brewPart
-      ? `yt-dlp/spotDL download directly; ffmpeg installs via <code>brew</code> — can take a few minutes.`
-      : `FETCH downloads portable copies into its own folder — no system install, no PATH changes.`;
+    desc = `FETCH downloads portable static binaries into its own folder — no system install, no compiling.`;
   } else {
     label = `${svg(IC_DOWNLOAD, 13)} INSTALL WITH BREW`;
     desc = `FETCH will run <code>brew</code> for you — ffmpeg can take a few minutes.`;
@@ -358,12 +160,7 @@ function missingBinariesWarn(): string {
   if (need.includes("spotdl")) manualBits.push(`<code>pip install spotdl</code>`);
 
   let actions: string;
-  if (needsHomebrew) {
-    actions = `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
-         <button class="btn btn-primary" id="setupHomebrewBtn" style="font-size:12.5px;display:inline-flex;align-items:center;gap:5px">${svg(IC_DOWNLOAD, 13)} SET UP HOMEBREW</button>
-         <span class="text-muted" style="font-size:11.5px">One-time setup — needed to install ffmpeg${need.includes("spotdl") ? " (and Python, for spotDL)" : ""}.</span>
-       </div>`;
-  } else if (canAuto) {
+  if (canAuto) {
     actions = `<div style="display:flex;align-items:center;gap:var(--space-2);margin-top:var(--space-2)">
          <button class="btn btn-primary" id="installBtn" style="font-size:12.5px">${label}</button>
          <span class="text-muted" style="font-size:11.5px">${desc}</span>
@@ -402,9 +199,7 @@ function viewInstalling(): string {
         ? "FETCH needs to restart to pick this up"
         : done
           ? (state.installIsUpdate ? "up to date" : "tools are ready")
-          : state.installers?.manager !== "fetch" && targets.includes("ffmpeg")
-            ? "running brew — please wait"
-            : "downloading — please wait"
+          : "downloading — please wait"
     }</span>
       </div>
       ${needsRestart
@@ -414,7 +209,7 @@ function viewInstalling(): string {
                ${errored && isHomebrewMissingError(state.installError) ? `<button class="btn btn-secondary" id="installLearnHow">LEARN HOW</button>` : ""}
                <button class="btn ${done ? "btn-primary" : "btn-secondary"}" id="installBack">${done ? "CONTINUE" : "BACK"}</button>
              </div>`
-        : ""
+        : `<button class="btn btn-secondary" id="installCancel">CANCEL</button>`
     }
     </div>
     ${done || errored
@@ -496,7 +291,7 @@ function cookieImportModalHtml(): string {
   const busy = s.state === "busy";
   const settled = s.state === "done" || s.state === "error";
 
-  const body = settled
+  const bodyHtml = settled
     ? `<div class="settings-group">
         <p class="text-muted" style="font-size:12.5px;display:flex;align-items:center;gap:8px;margin:0">
           ${s.state === "error" ? svg(IC_ALERT, 16, 2) : svg(IC_CHECK, 16, 2.5)}
@@ -551,7 +346,7 @@ function cookieImportModalHtml(): string {
         <span class="section-label">IMPORT COOKIES FROM BROWSER</span>
         ${busy ? "" : `<span class="icon-x" id="cookieImportClose">${svg(IC_X, 14)}</span>`}
       </div>
-      <div class="modal-body">${body}</div>
+      <div class="modal-body">${bodyHtml}</div>
       <div class="modal-foot">${foot}</div>
     </div>`;
 }
@@ -627,7 +422,7 @@ function toolUpdateRow(tool: "yt-dlp" | "ffmpeg" | "spotdl", info: ToolUpdate | 
   } else {
     status = `<span class="text-muted" style="font-size:11.5px">couldn't check</span>`;
   }
-  const canUpdate = !!info?.updateAvailable && (info.source === "portable" || info.source === "brew");
+  const canUpdate = !!info?.updateAvailable && (!!state.installers?.available || info.source === "brew");
   return `<div class="dir-row" style="justify-content:space-between">
     <span style="display:flex;align-items:center;gap:var(--space-2)">
       <span class="mono" style="font-size:12.5px">${label} ${current}</span>
@@ -711,26 +506,7 @@ function closeSettings() {
 // cookies first, since that's the usual culprit for sites like Douyin/TikTok
 // and for age-restricted/private videos. "homebrew" walks through installing
 // Homebrew by hand when FETCH can't do it for the user.
-type HelpTopic = "download" | "homebrew";
 let helpHideTimer: number | undefined;
-
-// A download error looks cookie-fixable when yt-dlp mentions cookies, sign-in,
-// age gates, or private/members-only content.
-function isCookieError(msg: string): boolean {
-  return /cookie|sign[- ]?in|log[- ]?in|login|private|age[- ]?restrict|members?-only|account|token/i.test(
-    msg
-  );
-}
-
-// Matches the exact phrasing the Rust backend uses whenever `brew` doesn't
-// resolve — both for ffmpeg's own install and for spotDL's Python fallback
-// on Intel Macs (see `brew_cmd` / `pip_install_spotdl` in src-tauri/src/lib.rs).
-function isHomebrewMissingError(msg: string): boolean {
-  return /homebrew isn'?t installed/i.test(msg);
-}
-
-const BREW_INSTALL_CMD =
-  '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
 
 function homebrewHelpHtml(): string {
   return `
@@ -818,6 +594,7 @@ function helpModalHtml(highlightCookies: boolean): string {
 function openHelp(topic: HelpTopic = "download", highlightCookies = false) {
   const overlay = document.getElementById("helpOverlay");
   if (!overlay) return;
+  state.helpOpen = true;
   window.clearTimeout(helpHideTimer);
   overlay.classList.remove("hidden");
   overlay.innerHTML = topic === "homebrew" ? homebrewHelpHtml() : helpModalHtml(highlightCookies);
@@ -873,6 +650,7 @@ async function recheckHomebrew() {
 }
 
 function closeHelp() {
+  state.helpOpen = false;
   const overlay = document.getElementById("helpOverlay");
   if (!overlay) return;
   overlay.classList.remove("open");
@@ -994,13 +772,6 @@ async function importCookiesFromBrowser() {
   renderSettingsModal();
 }
 
-function cookieParams() {
-  return {
-    cookieMode: state.cookieMode,
-    cookieFile: state.cookieMode === "file" ? state.cookieFile : null,
-  };
-}
-
 function historyStrip(): string {
   if (state.history.length === 0) {
     return `<div class="hist-strip">
@@ -1018,7 +789,7 @@ function historyTable(): string {
       (h, i) => `<tr>
         <td style="width:52px"><span class="tag ${i === 0 ? "tag-accent" : "tag-neutral"}">${esc(h.ext.toUpperCase())}</span></td>
         <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(h.title)}</td>
-        <td class="text-muted mono" style="white-space:nowrap;font-size:11px">${esc(h.sizeLabel)} · ${relTime(h.at)}</td>
+        <td class="text-muted mono" style="white-space:nowrap;font-size:11px">${h.sizeLabel ? `${esc(h.sizeLabel)} · ` : ""}${relTime(h.at)}</td>
         <td style="width:70px;text-align:right">${h.path ? `<button class="btn btn-ghost open-hist" data-path="${esc(h.path)}" style="font-size:12px">OPEN</button>` : ""
         }</td>
       </tr>`
@@ -1033,21 +804,12 @@ function historyTable(): string {
   </div>`;
 }
 
-function relTime(at: number): string {
-  const d = (Date.now() - at) / 1000;
-  if (d < 60) return "just now";
-  if (d < 3600) return `${Math.floor(d / 60)} min ago`;
-  if (d < 86400) return `${Math.floor(d / 3600)} h ago`;
-  return `${Math.floor(d / 86400)} d ago`;
-}
-
 // input row (live) — used in empty & success
 // Always the live, editable URL box — never swapped for a read-only chip or
 // disabled once something's been analyzed. Submitting again (Enter or the
 // button) just cancels whatever analyze is in flight and starts a new one;
 // see doAnalyze(). Only the trailing status tag changes per screen.
 function linkInputRow(placeholder: string): string {
-  const ready = canAnalyze();
   const a = state.analysis;
   let statusTag = "";
   if (a && state.screen === "playlist") {
@@ -1055,6 +817,8 @@ function linkInputRow(placeholder: string): string {
     statusTag = `<span class="tag tag-accent">PLAYLIST · ${count} VIDEOS</span>`;
   } else if (state.screen === "mix") {
     statusTag = `<span class="tag tag-neutral" style="font-weight:700">MIX · ENDLESS</span>`;
+  } else if (state.screen === "analyzing") {
+    statusTag = `<span class="tag tag-neutral">ANALYZING…</span>`;
   } else if (a && state.screen === "analyzed") {
     const src = detectSource(a.webpageUrl);
     statusTag = `<span class="tag tag-accent">${esc(a.extractor.toUpperCase() || src)}</span>`;
@@ -1065,7 +829,6 @@ function linkInputRow(placeholder: string): string {
       ${state.url ? `<span class="icon-x link-clear" id="clearLink" title="Clear">${svg(IC_X, 13)}</span>` : ""}
     </div>
     ${statusTag}
-    <button class="btn btn-primary" id="analyzeBtn" ${isLikelyUrl(state.url) && ready ? "" : "disabled"}>ANALYZE</button>
   </div>`;
 }
 
@@ -1073,18 +836,42 @@ function linkInputRow(placeholder: string): string {
 function viewEmpty(): string {
   const analyzing = state.screen === "analyzing";
   const src = state.url ? detectSource(state.url) : "";
+  const subtitle = analyzing
+    ? "analyzing link…"
+    : state.url
+      ? "press Enter to try again"
+      : "no link yet — paste one to start";
+  const p = state.preview;
+  const leftCard =
+    analyzing && p
+      ? `<figure class="blueprint preview">${corners}
+      <div class="thumb">
+        ${p.thumbnail
+        ? `<img src="${esc(p.thumbnail)}" alt="" onerror="this.style.display='none'">`
+        : `<span class="ph">[ no thumbnail ]</span>`
+      }
+        ${p.durationSeconds ? `<span class="dur">${fmtDuration(p.durationSeconds)}</span>` : ""}
+      </div>
+      <div class="meta">
+        <span class="ttl">${esc(p.title)}</span>
+        <div class="sub">
+          ${p.uploader ? `<span>${esc(p.uploader)}</span><span>·</span>` : ""}
+          <span class="tag tag-neutral" style="margin-left:auto">LOADING QUALITIES…</span>
+        </div>
+      </div>
+    </figure>`
+      : `<div class="blueprint dropzone" style="cursor:pointer">${corners}
+      <div class="inner">
+        <span style="font-size:24px;display:flex;align-items:center;justify-content:center">${analyzing ? svg(IC_LOADER, 28) : svg(IC_DOWNLOAD, 28)}</span>
+        <span class="mono" style="font-size:11px">${subtitle}</span>
+        ${state.url && !analyzing ? `<span class="tag tag-accent" style="margin-top:6px">${src} detected</span>` : ""}
+      </div>
+    </div>`;
   return `
   ${missingBinariesWarn()}
   ${linkInputRow("Paste a video, music or playlist link…")}
   <div class="grid-analyze">
-    <div class="blueprint dropzone">${corners}
-      <div class="inner">
-        <span style="font-size:24px;display:flex;align-items:center;justify-content:center">${analyzing ? svg(IC_LOADER, 28) : svg(IC_DOWNLOAD, 28)}</span>
-        <span class="mono" style="font-size:11px">${analyzing ? "analyzing link…" : "no link yet — paste one to start"
-    }</span>
-        ${state.url && !analyzing ? `<span class="tag tag-accent" style="margin-top:6px">${src} detected</span>` : ""}
-      </div>
-    </div>
+    ${leftCard}
     <div class="card locked">
       <div class="seg" style="align-self:stretch">
         <label class="seg-opt" style="flex:1;justify-content:center"><input type="radio" name="fmt" checked>Video</label>
@@ -1094,7 +881,7 @@ function viewEmpty(): string {
         ${["BEST", "1080P", "720P", "480P"]
       .map(
         (q) =>
-          `<div class="qcell"><span class="q">${q}</span><span class="sz">— MB</span></div>`
+          `<div class="qcell"><span class="q">${q}</span></div>`
       )
       .join("")}
       </div>
@@ -1106,11 +893,15 @@ function viewEmpty(): string {
 
 function viewAnalyzed(): string {
   const a = state.analysis!;
+  if (state.tab === "video" && a.videoOptions.length === 0 && a.audioOptions.length > 0) {
+    state.tab = "audio";
+  }
   const opts = state.tab === "video" ? a.videoOptions : a.audioOptions;
   if (!state.selectedQualityId && opts.length) {
     state.selectedQualityId = opts.find((o) => o.id === "1080p")?.id ?? opts[0].id;
   }
   const selected = opts.find((o) => o.id === state.selectedQualityId) ?? opts[0];
+  if (!selected) return "";
   return `
   ${linkInputRow("Paste a video, music or playlist link…")}
   <div class="grid-analyze">
@@ -1139,7 +930,6 @@ function viewAnalyzed(): string {
         (o) =>
           `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
                  <span class="q">${esc(o.label)}</span>
-                 <span class="sz">≈ ${fmtBytes(o.approxBytes)}</span>
                </div>`
       )
       .join("")}
@@ -1151,7 +941,7 @@ function viewAnalyzed(): string {
     }
       </div>
       ${optsRow()}
-      <button class="btn btn-primary btn-block" id="downloadBtn" style="display:inline-flex;align-items:center;gap:6px">${svg(IC_DOWNLOAD, 15)} DOWNLOAD · ${fmtBytes(selected.approxBytes).replace("— MB", "best")}</button>
+      <button class="btn btn-primary btn-block" id="downloadBtn" style="display:inline-flex;align-items:center;gap:6px">${svg(IC_DOWNLOAD, 15)} DOWNLOAD · ${esc(selected.label)}</button>
     </div>
   </div>
   ${dirRow()}
@@ -1160,11 +950,15 @@ function viewAnalyzed(): string {
 
 function viewPlaylist(): string {
   const a = state.analysis!;
+  if (state.tab === "video" && a.videoOptions.length === 0 && a.audioOptions.length > 0) {
+    state.tab = "audio";
+  }
   const opts = state.tab === "video" ? a.videoOptions : a.audioOptions;
   if (!state.selectedQualityId && opts.length) {
     state.selectedQualityId = opts.find((o) => o.id === "1080p")?.id ?? opts[0].id;
   }
   const selected = opts.find((o) => o.id === state.selectedQualityId) ?? opts[0];
+  if (!selected) return "";
   const count = a.playlistCount ?? a.entries.length;
   const selCount = state.entrySelected.filter(Boolean).length;
   const rows = a.entries
@@ -1203,7 +997,6 @@ function viewPlaylist(): string {
         (o) =>
           `<div class="qcell" data-q="${o.id}" role="button" aria-selected="${o.id === selected.id}">
                  <span class="q">${esc(o.label)}</span>
-                 <span class="sz">≈ ${fmtBytes(o.approxBytes)}</span>
                </div>`
       )
       .join("")}
@@ -1251,17 +1044,27 @@ function viewMix(): string {
   ${dirRow()}`;
 }
 
+function formatStageText(stage: string): string {
+  switch (stage) {
+    case "merging":
+      return "merging streams (FFmpeg)…";
+    case "extracting":
+      return "extracting audio (FFmpeg)…";
+    case "installing ffmpeg…":
+      return "installing ffmpeg (one-time)…";
+    case "updating yt-dlp…":
+      return "updating yt-dlp…";
+    case "starting":
+      return "starting…";
+    default:
+      return "downloading";
+  }
+}
+
 function viewDownloading(): string {
   const j = state.job!;
   const indeterminate = j.percent <= 0 || j.stage !== "downloading";
-  const stageText =
-    j.stage === "merging"
-      ? "merging streams (FFmpeg)…"
-      : j.stage === "extracting"
-        ? "extracting audio (FFmpeg)…"
-        : j.stage === "starting"
-          ? "starting…"
-          : "downloading";
+  const stageText = formatStageText(j.stage);
   return `
   <div class="link-row" style="opacity:.6">
     <input class="input mono" style="flex:1;min-height:42px;font-size:13px" placeholder="Paste another link when this finishes" disabled>
@@ -1288,19 +1091,37 @@ function viewDownloading(): string {
 // ── event wiring (re-run after every render) ─────────────────────────────
 function wireEvents() {
   $("#urlInput")?.addEventListener("input", (e) => {
+    const prevSpotify = detectSource(state.url) === "SPOTIFY";
     state.url = (e.target as HTMLInputElement).value;
-    const btn = $("#analyzeBtn") as HTMLButtonElement | null;
-    if (btn) btn.disabled = !isLikelyUrl(state.url);
+    const nextSpotify = detectSource(state.url) === "SPOTIFY";
+    if (prevSpotify !== nextSpotify && state.screen === "empty") render();
+    scheduleAutoAnalyze();
+  });
+  $("#urlInput")?.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text")?.trim();
+    if (text && isLikelyUrl(text)) {
+      state.url = text;
+      setTimeout(() => {
+        if (isLikelyUrl(state.url)) doAnalyze({ auto: true });
+      }, 0);
+    }
   });
   $("#urlInput")?.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter" && isLikelyUrl(state.url)) doAnalyze();
+    if ((e as KeyboardEvent).key === "Enter" && isLikelyUrl(state.url)) doAnalyze({ force: true });
   });
-  $("#analyzeBtn")?.addEventListener("click", doAnalyze);
+  body().querySelector<HTMLElement>(".dropzone")?.addEventListener("click", () => {
+    if (isLikelyUrl(state.url)) {
+      doAnalyze({ force: true });
+    } else {
+      $("#urlInput")?.focus();
+    }
+  });
   $("#clearLink")?.addEventListener("click", resetToEmpty);
   $("#pickDir")?.addEventListener("click", pickDir);
   $("#downloadBtn")?.addEventListener("click", startDownload);
   $("#cancelBtn")?.addEventListener("click", cancelDownload);
   $("#installBtn")?.addEventListener("click", startInstall);
+  $("#installCancel")?.addEventListener("click", cancelInstall);
   $("#installBack")?.addEventListener("click", () => (state.installIsUpdate ? finishToolUpdate() : finishInstall()));
   $("#installRestart")?.addEventListener("click", restartApp);
   $("#setupHomebrewBtn")?.addEventListener("click", () => openHelp("homebrew"));
@@ -1318,13 +1139,13 @@ function wireEvents() {
       })
     );
 
-  // quality cells
+  // quality cells — targeted DOM patch so thumbnails don't flicker
   body()
     .querySelectorAll<HTMLElement>(".qcell[data-q]")
     .forEach((c) =>
       c.addEventListener("click", () => {
         state.selectedQualityId = c.dataset.q!;
-        render();
+        patchQualitySelection();
       })
     );
 
@@ -1345,7 +1166,7 @@ function wireEvents() {
       b.addEventListener("click", () => invoke("reveal_in_folder", { path: b.dataset.path }))
     );
 
-  // playlist
+  // playlist — targeted DOM patch instead of wiping the list on every click
   body()
     .querySelectorAll<HTMLElement>("[data-entry]")
     .forEach((row) =>
@@ -1353,14 +1174,14 @@ function wireEvents() {
         e.preventDefault();
         const i = Number(row.dataset.entry);
         state.entrySelected[i] = !state.entrySelected[i];
-        render();
+        patchPlaylistSelection();
       })
     );
   $("#selectAll")?.addEventListener("click", (e) => {
     e.preventDefault();
     const all = state.entrySelected.every(Boolean);
     state.entrySelected = state.entrySelected.map(() => !all);
-    render();
+    patchPlaylistSelection();
   });
   $("#downloadPlaylist")?.addEventListener("click", startPlaylistDownload);
 
@@ -1389,6 +1210,18 @@ function wireEvents() {
 // Kills whatever analyze is currently running on the backend, if any — used
 // whenever the link changes or the user backs out, so a stale request can
 // never land and clobber what's on screen.
+let lastRequestedUrl = "";
+let autoAnalyzeTimer: number | undefined;
+
+// Typing/pasting a link analyzes it automatically once the input settles —
+// there is no separate ANALYZE button.
+function scheduleAutoAnalyze() {
+  window.clearTimeout(autoAnalyzeTimer);
+  if (!isLikelyUrl(state.url) || !canAnalyze()) return;
+  if (state.screen === "downloading" || state.screen === "installing") return;
+  autoAnalyzeTimer = window.setTimeout(() => doAnalyze({ auto: true }), 450);
+}
+
 function cancelInFlightAnalyze() {
   if (state.analyzingId) {
     invoke("cancel_analyze", { id: state.analyzingId }).catch(() => { });
@@ -1398,6 +1231,8 @@ function cancelInFlightAnalyze() {
 
 function resetToEmpty() {
   cancelInFlightAnalyze();
+  lastRequestedUrl = "";
+  state.preview = null;
   state.screen = "empty";
   state.url = "";
   state.analysis = null;
@@ -1412,6 +1247,8 @@ function resetToEmpty() {
 // retyping the link they already pasted.
 function backToEmptyKeepingUrl() {
   cancelInFlightAnalyze();
+  lastRequestedUrl = "";
+  state.preview = null;
   state.screen = "empty";
   state.analysis = null;
   state.selectedQualityId = "";
@@ -1474,6 +1311,7 @@ function showErrorToast(message: string) {
   activeToastKind = "error";
   wrap.classList.remove("hidden");
   const homebrewHint = isHomebrewMissingError(message);
+  const formatHint = isFormatUnavailableError(message);
   const cookieHint = isCookieError(message);
   wrap.innerHTML = `
     <div class="banner toast error">
@@ -1482,10 +1320,15 @@ function showErrorToast(message: string) {
         <span class="b-ttl">COULDN'T DO THAT</span>
         <span class="b-sub" style="white-space:normal">${esc(message)}</span>
       </div>
+      ${formatHint && state.installers?.available ? `<button class="btn btn-primary" id="toastUpdateYtdlp" style="flex:none">UPDATE YT-DLP</button>` : ""}
       <button class="btn btn-secondary" id="toastLearnMore" style="flex:none">${homebrewHint ? "LEARN HOW" : "LEARN MORE"}</button>
       <span class="icon-x" id="toastClose">${svg(IC_X, 14)}</span>
     </div>`;
   document.getElementById("toastClose")?.addEventListener("click", dismissToast);
+  document.getElementById("toastUpdateYtdlp")?.addEventListener("click", () => {
+    dismissToast();
+    startToolUpdate("yt-dlp");
+  });
   document.getElementById("toastLearnMore")?.addEventListener("click", () => {
     dismissToast();
     openHelp(homebrewHint ? "homebrew" : "download", cookieHint);
@@ -1526,9 +1369,6 @@ function pendingUpdateItems(): { tool: string; label: string; from?: string; to?
   const items: { tool: string; label: string; from?: string; to?: string }[] = [];
   if (result.ytDlp.updateAvailable) {
     items.push({ tool: "yt-dlp", label: "yt-dlp", from: result.ytDlp.current, to: result.ytDlp.latest });
-  }
-  if (result.ffmpeg.updateAvailable) {
-    items.push({ tool: "ffmpeg", label: "ffmpeg", from: result.ffmpeg.current, to: result.ffmpeg.latest });
   }
   if (result.spotdl?.updateAvailable) {
     items.push({ tool: "spotdl", label: "spotDL", from: result.spotdl.current, to: result.spotdl.latest });
@@ -1607,9 +1447,12 @@ function showUpdateToast(items: { tool: string; label: string; from?: string; to
   requestAnimationFrame(() => wrap.classList.add("open"));
 }
 
+let installCancelRequested = false;
+
 function startInstall() {
   const need = missingTools();
   if (!need.length) return;
+  installCancelRequested = false;
   state.installTargets = need;
   state.installIsUpdate = false;
   state.installReturnScreen = null;
@@ -1619,6 +1462,7 @@ function startInstall() {
   state.screen = "installing";
   render();
   invoke("install_tools", { tools: need }).catch((err) => {
+    if (installCancelRequested) return;
     // fallback if the event didn't fire (e.g. failed to launch)
     if (!state.installError && !state.installDone) {
       state.installError = String(err);
@@ -1627,11 +1471,27 @@ function startInstall() {
   });
 }
 
+function cancelInstall() {
+  installCancelRequested = true;
+  invoke("cancel_install").catch(() => { });
+  if (state.installIsUpdate) {
+    finishToolUpdate();
+  } else {
+    finishInstall();
+  }
+}
+
 async function finishInstall() {
+  state.installTargets = [];
+  state.installIsUpdate = false;
+  state.installDone = false;
+  state.installError = "";
+  state.installLog = [];
+  resetToEmpty();
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
   } catch { }
-  resetToEmpty();
+  render();
 }
 
 // Same screen/log/progress UI as a first-time install, but for updating a
@@ -1639,6 +1499,7 @@ async function finishInstall() {
 // update toast. Unlike startInstall() this can happen mid-session, so it
 // remembers the current screen and returns to it instead of resetting.
 function startToolUpdate(tool: string) {
+  installCancelRequested = false;
   state.installTargets = [tool];
   state.installIsUpdate = true;
   state.installReturnScreen = state.screen === "installing" ? "empty" : state.screen;
@@ -1648,6 +1509,7 @@ function startToolUpdate(tool: string) {
   state.screen = "installing";
   render();
   invoke("update_tool", { tool }).catch((err) => {
+    if (installCancelRequested) return;
     if (!state.installError && !state.installDone) {
       state.installError = String(err);
       if (state.screen === "installing") render();
@@ -1656,15 +1518,23 @@ function startToolUpdate(tool: string) {
 }
 
 async function finishToolUpdate() {
+  const targetScreen = (state.installReturnScreen && state.installReturnScreen !== "installing")
+    ? state.installReturnScreen
+    : "empty";
+  state.screen = targetScreen;
+  state.installReturnScreen = null;
+  state.installTargets = [];
+  state.installIsUpdate = false;
+  state.installDone = false;
+  state.installError = "";
+  state.installLog = [];
+  render();
+  if (state.settingsOpen) renderSettingsModal();
+
   try {
     state.binaries = await invoke<Binaries>("check_binaries");
   } catch { }
   await checkForUpdates({ toast: false });
-  state.screen = state.installReturnScreen ?? "empty";
-  state.installReturnScreen = null;
-  state.installTargets = [];
-  state.installIsUpdate = false;
-  render();
   if (state.settingsOpen) renderSettingsModal();
 }
 
@@ -1692,22 +1562,38 @@ async function pickDir() {
   }
 }
 
-async function doAnalyze() {
+async function doAnalyze(opts: { force?: boolean; auto?: boolean } = {}) {
+  window.clearTimeout(autoAnalyzeTimer);
   if (!isLikelyUrl(state.url)) return;
-  // Missing the tool this link needs (e.g. a Spotify link with spotDL not yet
-  // installed) — kick off the install for exactly that set instead of failing.
-  if (!canAnalyze()) {
-    startInstall();
+  const requested = state.url.trim();
+  // The same link is already analyzed / being analyzed — nothing to redo
+  // (Enter forces a retry).
+  if (
+    !opts.force &&
+    requested === lastRequestedUrl &&
+    (state.screen === "analyzing" ||
+      state.screen === "analyzed" ||
+      state.screen === "playlist" ||
+      state.screen === "mix")
+  ) {
     return;
   }
+  // Missing the tool this link needs (e.g. a Spotify link with spotDL not yet
+  // installed): an explicit Enter kicks off the install, auto-analyze doesn't.
+  if (!canAnalyze()) {
+    if (!opts.auto) startInstall();
+    return;
+  }
+  lastRequestedUrl = requested;
   // A Mix/Radio link is recognizable from the URL alone (see isLikelyMixUrl) —
   // jump straight to the chooser instead of burning a whole analyze
   // round-trip just to learn what the pasted link already told us. The real
   // analyze only happens once the user picks THIS VIDEO ONLY (on the
   // stripped, non-mix URL) or FIRST N (mixResolving, below).
-  if (!state.mixResolving && isLikelyMixUrl(state.url)) {
+  if (!state.mixResolving && isLikelyMixUrl(requested)) {
     cancelInFlightAnalyze();
     state.mixMode = "single";
+    state.preview = null;
     state.screen = "mix";
     render();
     return;
@@ -1715,15 +1601,28 @@ async function doAnalyze() {
   cancelInFlightAnalyze(); // editing + resubmitting replaces whatever was running, not queues alongside it
   const id = crypto.randomUUID();
   state.analyzingId = id;
-  const urlAtRequest = state.url; // the link as submitted — further edits don't retarget this request
+  const urlAtRequest = requested; // the link as submitted — further edits don't retarget this request
   const resolvingCapped = state.mixResolving === "capped";
   state.mixResolving = null;
+  state.preview = null;
   state.screen = "analyzing";
   render();
+
+  // Instant title/thumbnail preview while yt-dlp works out the real qualities.
+  invoke<QuickMeta | null>("quick_meta", { url: urlAtRequest })
+    .then((meta) => {
+      if (meta && state.analyzingId === id && state.screen === "analyzing") {
+        state.preview = meta;
+        render();
+      }
+    })
+    .catch(() => { });
+
   try {
     const res = await invoke<AnalyzeResult>("analyze", { id, url: urlAtRequest, ...cookieParams() });
     if (state.analyzingId !== id) return; // superseded by a newer request meanwhile — drop it
     state.analyzingId = null;
+    state.preview = null;
     state.analysis = res;
     state.selectedQualityId = "";
     // Audio-only sources (Spotify) have no video tiers — start on the audio tab.
@@ -1755,13 +1654,60 @@ async function doAnalyze() {
   render();
 }
 
-function currentSelection(): QualityOption | undefined {
-  const a = state.analysis!;
-  const opts = state.tab === "video" ? a.videoOptions : a.audioOptions;
-  return opts.find((o) => o.id === state.selectedQualityId) ?? opts[0];
+function patchQualitySelection() {
+  const sel = currentSelection();
+  if (!sel) return;
+  body()
+    .querySelectorAll<HTMLElement>(".qcell[data-q]")
+    .forEach((cell) => {
+      cell.setAttribute("aria-selected", String(cell.dataset.q === sel.id));
+    });
+  const dlBtn = document.getElementById("downloadBtn");
+  if (dlBtn) {
+    dlBtn.innerHTML = `${svg(IC_DOWNLOAD, 15)} DOWNLOAD · ${esc(sel.label)}`;
+  }
+}
+
+function patchPlaylistSelection() {
+  const a = state.analysis;
+  if (!a) return;
+  const total = a.entries.length;
+  const selCount = state.entrySelected.filter(Boolean).length;
+  body()
+    .querySelectorAll<HTMLElement>(".queue-row[data-entry]")
+    .forEach((row) => {
+      const i = Number(row.dataset.entry);
+      const sel = !!state.entrySelected[i];
+      row.style.background = sel ? "var(--color-accent-100)" : "";
+      const box = row.firstElementChild as HTMLElement | null;
+      if (box) {
+        box.style.background = sel ? "var(--color-accent)" : "";
+        box.style.color = sel ? "var(--color-bg)" : "";
+        box.style.border = sel ? "" : "1px solid var(--color-neutral-400)";
+        box.textContent = sel ? "✓" : "";
+      }
+      const nm = row.querySelector<HTMLElement>(".nm");
+      if (nm) {
+        nm.style.color = sel ? "" : "var(--color-neutral-700)";
+      }
+    });
+  const selectAll = document.getElementById("selectAll");
+  if (selectAll) {
+    selectAll.textContent = selCount === total ? "Clear all" : "Select all";
+  }
+  const footCount = body().querySelector<HTMLElement>(".playlist-foot span");
+  if (footCount) {
+    footCount.textContent = `${selCount}/${total} selected`;
+  }
+  const dlBtn = document.getElementById("downloadPlaylist") as HTMLButtonElement | null;
+  if (dlBtn) {
+    dlBtn.disabled = selCount === 0;
+    dlBtn.innerHTML = `${svg(IC_DOWNLOAD, 15)} DOWNLOAD ${selCount} SELECTED`;
+  }
 }
 
 async function startDownload() {
+  cancelInFlightAnalyze();
   const a = state.analysis!;
   const sel = currentSelection();
   if (!sel) return;
@@ -1772,8 +1718,8 @@ async function startDownload() {
     speed: "",
     eta: "",
     stage: "starting",
-    name: a.title + (state.tab === "audio" ? `.${audioExtLabel(state.selectedQualityId)}` : ".mp4"),
-    sizeLabel: fmtBytes(sel.approxBytes),
+    name: a.title + (state.tab === "audio" ? `.${audioExtLabel(sel.id)}` : ".mp4"),
+    sizeLabel: "",
   };
   state.screen = "downloading";
   render();
@@ -1783,7 +1729,7 @@ async function startDownload() {
     formatSelector: sel.formatSelector,
     qualityId: sel.id,
     kind: state.tab,
-    audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
+    audioFormat: state.tab === "audio" ? sel.id : null,
     outputDir: state.outputDir,
     writeThumbnail: state.writeThumbnail,
     writeDescription: state.writeDescription,
@@ -1829,7 +1775,7 @@ function startPlaylistDownload() {
     formatSelector: sel.formatSelector,
     qualityId: sel.id,
     kind: state.tab,
-    audioFormat: state.tab === "audio" ? state.selectedQualityId : null,
+    audioFormat: state.tab === "audio" ? sel.id : null,
     outputDir: state.outputDir,
     writeThumbnail: state.writeThumbnail,
     writeDescription: state.writeDescription,
@@ -1844,18 +1790,26 @@ function mixContinue() {
     // Strip the radio/list/index params off the pasted link and run the
     // (only) analyze so we get the real clip's title, thumbnail and
     // per-format sizes — no separate mix analyze ever happened.
-    state.url = state.url
-      .replace(/[?&]list=[^&]+/g, "")
-      .replace(/[?&]index=[^&]+/g, "")
-      .replace(/[?&]start_radio=[^&]+/g, "");
-    doAnalyze();
+    try {
+      const u = new URL(state.url);
+      u.searchParams.delete("list");
+      u.searchParams.delete("index");
+      u.searchParams.delete("start_radio");
+      state.url = u.toString();
+    } catch {
+      state.url = state.url
+        .replace(/[?&]list=[^&]+/g, "")
+        .replace(/[?&]index=[^&]+/g, "")
+        .replace(/[?&]start_radio=[^&]+/g, "");
+    }
+    doAnalyze({ force: true });
   } else {
     // capped: this is the first time the mix actually needs to be resolved
     // (to get real entries to pre-select from) — analyze the original,
     // unstripped URL and land on the quality picker once it resolves.
     state.mixResolving = "capped";
     state.selectedQualityId = "";
-    doAnalyze();
+    doAnalyze({ force: true });
   }
 }
 
@@ -1916,10 +1870,12 @@ async function wireBackendEvents() {
 
   // installer events
   await listen<string>("install-log", (e) => {
+    if (installCancelRequested) return;
     state.installLog.push(e.payload);
     if (state.screen === "installing") appendInstallLog();
   });
   await listen("install-done", async () => {
+    if (installCancelRequested) return;
     state.installDone = true;
     // Antivirus real-time scanning can briefly lock a just-downloaded .exe,
     // so the very first check right after "done" can spuriously say it's
@@ -1934,6 +1890,7 @@ async function wireBackendEvents() {
     if (state.screen === "installing") render();
   });
   await listen<string>("install-error", (e) => {
+    if (installCancelRequested) return;
     state.installError = e.payload || "Install failed.";
     if (state.screen === "installing") render();
   });
@@ -1951,72 +1908,10 @@ function patchProgress() {
   const indeterminate = j.percent <= 0 || j.stage !== "downloading";
   if (bar) bar.classList.toggle("indeterminate", indeterminate);
   if (fill) fill.style.width = `${Math.max(0, Math.min(100, j.percent))}%`;
-  const stageText =
-    j.stage === "merging"
-      ? "merging streams (FFmpeg)…"
-      : j.stage === "extracting"
-        ? "extracting audio (FFmpeg)…"
-        : "downloading";
+  const stageText = formatStageText(j.stage);
   if (pct) pct.textContent = indeterminate ? stageText : `${j.percent.toFixed(0)}%`;
   if (eta) eta.textContent = `${j.speed}${j.eta ? ` · ${j.eta} left` : ""}`;
   if (stageEl) stageEl.textContent = stageText;
-}
-
-// ── persistence ──────────────────────────────────────────────────────────
-function persistHistory() {
-  try {
-    localStorage.setItem("fetch.history", JSON.stringify(state.history.slice(0, 30)));
-  } catch { }
-}
-function loadHistory() {
-  try {
-    const raw = localStorage.getItem("fetch.history");
-    if (raw) state.history = JSON.parse(raw);
-  } catch { }
-}
-
-function persistSettings() {
-  try {
-    localStorage.setItem(
-      "fetch.settings",
-      JSON.stringify({
-        outputDir: state.outputDir,
-        // Only an explicit folder pick "pins" outputDir; otherwise it's just
-        // the machine-derived default and we let the backend recompute it each
-        // launch, so a relocated Downloads folder is always tracked.
-        dirPinned,
-        cookieMode: state.cookieMode,
-        cookieBrowser: state.cookieBrowser,
-        cookieFile: state.cookieFile,
-      })
-    );
-  } catch { }
-}
-let hasSavedOutputDir = false;
-// True only when the user explicitly picked a download folder. Legacy saved
-// settings (before this flag existed) lack it, so they're treated as unpinned
-// and fall through to the live default — auto-migrating anyone whose stored
-// outputDir was just the old machine default.
-let dirPinned = false;
-function loadSettings() {
-  try {
-    const raw = localStorage.getItem("fetch.settings");
-    if (!raw) return;
-    const s = JSON.parse(raw);
-    if (s.dirPinned === true && typeof s.outputDir === "string" && s.outputDir) {
-      state.outputDir = s.outputDir;
-      hasSavedOutputDir = true;
-      dirPinned = true;
-    }
-    // "browser" was a legacy mode (live --cookies-from-browser on every
-    // request, replaced by the one-time import below) — treat it as "none"
-    // for anyone who had it saved from before.
-    if (s.cookieMode === "file") {
-      state.cookieMode = "file";
-    }
-    if (typeof s.cookieBrowser === "string" && s.cookieBrowser) state.cookieBrowser = s.cookieBrowser;
-    if (typeof s.cookieFile === "string") state.cookieFile = s.cookieFile;
-  } catch { }
 }
 
 // ── theme toggle ─────────────────────────────────────────────────────────
@@ -2042,6 +1937,32 @@ function wireChrome() {
   toastWrap.addEventListener("mouseleave", () => {
     if (toastWrap.classList.contains("open") && activeToastKind !== "update") armToastTimer();
   });
+
+  // Global paste handler: pasting a URL anywhere in the app automatically loads and analyzes it
+  window.addEventListener("paste", (e) => {
+    const active = document.activeElement as HTMLElement | null;
+    if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) return;
+    if (state.settingsOpen || state.helpOpen || state.cookieImportModal.open) return;
+    if (state.screen === "downloading" || state.screen === "installing") return;
+
+    const text = e.clipboardData?.getData("text")?.trim();
+    if (text && isLikelyUrl(text)) {
+      e.preventDefault();
+      state.url = text;
+      doAnalyze({ auto: true });
+    }
+  });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (state.helpOpen) {
+      closeHelp();
+    } else if (state.cookieImportModal.open) {
+      if (state.cookieImport.state !== "busy") closeCookieImportModal();
+    } else if (state.settingsOpen) {
+      closeSettings();
+    }
+  });
 }
 
 // ── boot ─────────────────────────────────────────────────────────────────
@@ -2049,7 +1970,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   loadHistory();
   loadSettings();
   wireChrome();
-  if (!hasSavedOutputDir) state.outputDir = "~/Downloads/Fetch";
+  if (!state.hasSavedOutputDir) state.outputDir = "~/Downloads/Fetch";
   render(); // paint immediately; backend calls below only enrich the view
 
   try {
@@ -2057,7 +1978,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     console.warn("Tauri events unavailable (running outside the app shell):", e);
   }
-  if (!hasSavedOutputDir) {
+  if (!state.hasSavedOutputDir) {
     try {
       state.outputDir = await invoke<string>("default_download_dir");
     } catch { }

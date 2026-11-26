@@ -75,42 +75,6 @@ html {
   color-scheme: light;
 }
 
-#app[data-theme="dark"] {
-  color-scheme: dark;
-  --color-bg: #131415;
-  --color-surface: #1d1f20;
-  --color-text: #f5f5f8;
-  --color-divider: color-mix(in srgb, #f5f5f8 16%, transparent);
-
-  /* Neutral ramp inverted */
-  --color-neutral-100: #1d1f20;
-  --color-neutral-200: #2b2b2d;
-  --color-neutral-300: #424244;
-  --color-neutral-400: #5d5d60;
-  --color-neutral-500: #7a7a7d;
-  --color-neutral-600: #98989b;
-  --color-neutral-700: #b7b7ba;
-  --color-neutral-800: #d4d4d7;
-  --color-neutral-900: #e7e7ea;
-
-  /* Accent inverted */
-  --color-accent: #f5f5f8;
-  --color-accent-2: #d4d4d7;
-  --color-accent-100: #1d1f20;
-  --color-accent-200: #2b2b2d;
-  --color-accent-300: #424244;
-  --color-accent-400: #5d5d60;
-  --color-accent-500: #7a7a7d;
-  --color-accent-600: #98989b;
-  --color-accent-700: #b7b7ba;
-  --color-accent-800: #d4d4d7;
-  --color-accent-900: #e7e7ea;
-
-  --shadow-sm: 0 1px 2px color-mix(in srgb, #000 30%, transparent);
-  --shadow-md: 0 3px 10px color-mix(in srgb, #000 40%, transparent);
-  --shadow-lg: 0 12px 32px color-mix(in srgb, #000 50%, transparent);
-}
-
 body {
   margin: 0;
   font-family: var(--font-body);
@@ -825,7 +789,8 @@ body,
 .qgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  grid-auto-rows: minmax(48px, 1fr);
+  grid-auto-rows: 52px;
+  align-content: start;
   gap: var(--space-2);
   flex: 1;
   min-height: 0;
@@ -840,6 +805,7 @@ body,
   transition: border-color .15s ease, background-color .15s ease;
   display: flex;
   flex-direction: column;
+  justify-content: center;
 }
 
 .qcell .q {
@@ -1212,11 +1178,16 @@ body,
    900 = lightest/closest to text) so every text-on-fill pairing that worked
    in light mode keeps its contrast in dark mode. */
 #app[data-theme="dark"] {
+  color-scheme: dark;
   --color-bg: #0a0a0b;
   --color-surface: #17181a;
   --color-text: #f7f7f8;
   --color-divider: color-mix(in srgb, #f7f7f8 22%, transparent);
   --muted-alpha: 68%;
+
+  --shadow-sm: 0 1px 2px color-mix(in srgb, #000 30%, transparent);
+  --shadow-md: 0 3px 10px color-mix(in srgb, #000 40%, transparent);
+  --shadow-lg: 0 12px 32px color-mix(in srgb, #000 50%, transparent);
 
   --color-neutral-100: #18191b;
   --color-neutral-200: #232426;
