@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { checkForAppUpdate } from "./updater";
 import type {
   AnalyzeResult,
   Binaries,
@@ -1257,105 +1258,266 @@ function backToEmptyKeepingUrl() {
   render();
 }
 
-// ── toasts — float above whatever screen is current; opening/closing only
-// ever touches #toastWrap, never #body, so they never disrupt the user's
-// next action underneath. Slide up from the bottom edge.
-// "done"/"error" toasts auto-dismiss after 5s (paused while the pointer is
-// over them). "update" toasts don't — they're only ever closed by the user
-// or by the update actually being applied.
-const TOAST_DURATION = 5000;
-const TOAST_TRANSITION = 220; // must match .toast-wrap .toast's transition duration in styles.css
-let toastAutoTimer: number | undefined;
+// ── toasts — persistent phone-style notification stack ───────────────────
+// Never auto-dismissed: important error and completion notices stay visible
+// until explicitly dismissed by the user (`✕`, `CLEAR ALL`, or applying an update).
+// Multiple notifications stack at the bottom like phone notifications and fan
+// out on hover or toggle.
+type UpdateToastItem = { tool: string; label: string; from?: string; to?: string };
+type ToastEntry =
+  | { id: number; kind: "done"; item: HistoryItem }
+  | { id: number; kind: "error"; message: string; homebrewHint: boolean; formatHint: boolean; cookieHint: boolean }
+  | { id: number; kind: "update"; items: UpdateToastItem[] };
+
+const TOAST_TRANSITION = 220; // must match .toast-wrap transition duration in styles.css
+const MAX_TOASTS = 20;
+let nextToastId = 1;
+let toasts: ToastEntry[] = [];
+const dismissingToastIds = new Set<number>();
+let justAddedToastId: number | null = null;
+let toastHoverExpanded = false;
+let toastPinnedExpanded = false;
+let toastHoverLeaveTimer: number | undefined;
 let toastCleanupTimer: number | undefined;
-// Tracked so the shared #toastWrap knows which behavior applies to what's
-// on screen right now (mouse-leave re-arming, and what to do once
-// dismissToast runs).
-let activeToastKind: "done" | "update" | "error" | null = null;
-// Set only by the user clicking the update toast's own ✕. Session-scoped —
-// resets on relaunch, so the next startup check surfaces it again either way.
+// Set only by the user clicking the update toast's own ✕ (or CLEAR ALL).
+// Session-scoped — resets on relaunch.
 let updateToastDismissedManually = false;
 
-function armToastTimer() {
-  window.clearTimeout(toastAutoTimer);
-  toastAutoTimer = window.setTimeout(dismissToast, TOAST_DURATION);
+function isToastStackExpanded(): boolean {
+  return toasts.length > 1 && (toastHoverExpanded || toastPinnedExpanded);
+}
+
+function pushToast(entry: ToastEntry) {
+  window.clearTimeout(toastCleanupTimer);
+  justAddedToastId = entry.id;
+  toasts.unshift(entry);
+  if (toasts.length > MAX_TOASTS) toasts.length = MAX_TOASTS;
+  renderToasts();
 }
 
 function showDoneToast(item: HistoryItem) {
-  const wrap = document.getElementById("toastWrap");
-  if (!wrap) return;
-  window.clearTimeout(toastCleanupTimer);
-  activeToastKind = "done";
-  wrap.classList.remove("hidden");
-  wrap.innerHTML = `
-    <div class="banner toast">
-      <span class="ok">${svg(IC_CHECK, 18, 2.5)}</span>
-      <div class="b-txt">
-        <span class="b-ttl">DONE — SAVED TO DISK</span>
-        <span class="b-sub" title="${esc(item.path ?? "")}">${esc(item.path ?? item.title)}${item.sizeLabel ? ` · ${item.sizeLabel}` : ""}</span>
-      </div>
-      ${item.path ? `<button class="btn btn-primary open-hist" data-path="${esc(item.path)}" style="flex:none">OPEN FOLDER</button>` : ""}
-      <span class="icon-x" id="toastClose">${svg(IC_X, 14)}</span>
-    </div>`;
-  wrap.querySelector<HTMLElement>(".open-hist")?.addEventListener("click", (e) =>
-    invoke("reveal_in_folder", { path: (e.currentTarget as HTMLElement).dataset.path })
-  );
-  document.getElementById("toastClose")?.addEventListener("click", dismissToast);
-  requestAnimationFrame(() => wrap.classList.add("open"));
-  armToastTimer();
+  pushToast({ id: nextToastId++, kind: "done", item });
 }
 
 function showErrorToast(message: string) {
-  const wrap = document.getElementById("toastWrap");
-  if (!wrap) return;
-  window.clearTimeout(toastCleanupTimer);
-  activeToastKind = "error";
-  wrap.classList.remove("hidden");
   const homebrewHint = isHomebrewMissingError(message);
   const formatHint = isFormatUnavailableError(message);
   const cookieHint = isCookieError(message);
-  wrap.innerHTML = `
-    <div class="banner toast error">
-      <span class="ok">${svg(IC_ALERT, 18, 2)}</span>
-      <div class="b-txt">
-        <span class="b-ttl">COULDN'T DO THAT</span>
-        <span class="b-sub" style="white-space:normal">${esc(message)}</span>
-      </div>
-      ${formatHint && state.installers?.available ? `<button class="btn btn-primary" id="toastUpdateYtdlp" style="flex:none">UPDATE YT-DLP</button>` : ""}
-      <button class="btn btn-secondary" id="toastLearnMore" style="flex:none">${homebrewHint ? "LEARN HOW" : "LEARN MORE"}</button>
-      <span class="icon-x" id="toastClose">${svg(IC_X, 14)}</span>
-    </div>`;
-  document.getElementById("toastClose")?.addEventListener("click", dismissToast);
-  document.getElementById("toastUpdateYtdlp")?.addEventListener("click", () => {
-    dismissToast();
-    startToolUpdate("yt-dlp");
-  });
-  document.getElementById("toastLearnMore")?.addEventListener("click", () => {
-    dismissToast();
-    openHelp(homebrewHint ? "homebrew" : "download", cookieHint);
-  });
-  requestAnimationFrame(() => wrap.classList.add("open"));
-  armToastTimer();
+  pushToast({ id: nextToastId++, kind: "error", message, homebrewHint, formatHint, cookieHint });
 }
 
-function dismissToast() {
-  window.clearTimeout(toastAutoTimer);
+function dismissToast(id: number, markUpdateDismissed = true) {
+  if (dismissingToastIds.has(id)) return;
+  const idx = toasts.findIndex((t) => t.id === id);
+  if (idx === -1) return;
+  if (toasts[idx].kind === "update" && markUpdateDismissed) {
+    updateToastDismissedManually = true;
+  }
+
   const wrap = document.getElementById("toastWrap");
   if (!wrap) return;
-  const wasUpdate = activeToastKind === "update";
+
+  if (toasts.length === 1) {
+    toasts = [];
+    dismissingToastIds.clear();
+    toastHoverExpanded = false;
+    toastPinnedExpanded = false;
+    wrap.classList.remove("open");
+    toastCleanupTimer = window.setTimeout(() => {
+      if (toasts.length === 0) {
+        wrap.classList.add("hidden");
+        wrap.innerHTML = "";
+      }
+    }, TOAST_TRANSITION);
+    return;
+  }
+
+  dismissingToastIds.add(id);
+  const card = wrap.querySelector<HTMLElement>(`.toast-card[data-toast-id="${id}"]`);
+  card?.classList.add("dismissing");
+  window.setTimeout(() => {
+    dismissingToastIds.delete(id);
+    const curIdx = toasts.findIndex((t) => t.id === id);
+    if (curIdx !== -1) toasts.splice(curIdx, 1);
+    if (toasts.length <= 1) {
+      toastPinnedExpanded = false;
+      toastHoverExpanded = false;
+    }
+    if (toasts.length === 0) {
+      wrap.classList.remove("open");
+      toastCleanupTimer = window.setTimeout(() => {
+        if (toasts.length === 0) {
+          wrap.classList.add("hidden");
+          wrap.innerHTML = "";
+        }
+      }, TOAST_TRANSITION);
+    } else {
+      renderToasts();
+    }
+  }, 150);
+}
+
+function clearAllToasts() {
+  if (toasts.some((t) => t.kind === "update")) {
+    updateToastDismissedManually = true;
+  }
+  toasts = [];
+  dismissingToastIds.clear();
+  toastHoverExpanded = false;
+  toastPinnedExpanded = false;
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap) return;
   wrap.classList.remove("open");
   toastCleanupTimer = window.setTimeout(() => {
-    wrap.classList.add("hidden");
-    wrap.innerHTML = "";
-    activeToastKind = null;
-    if (wasUpdate) {
-      // Only reachable via the toast's own ✕ (it never auto-dismisses).
-      updateToastDismissedManually = true;
-    } else {
-      // A "done" toast just finished its course — if an update notice was
-      // waiting behind it, bring it back instead of losing it silently.
-      maybeResurfaceUpdateToast();
+    if (toasts.length === 0) {
+      wrap.classList.add("hidden");
+      wrap.innerHTML = "";
     }
   }, TOAST_TRANSITION);
+}
+
+// Updates collapsed/expanded classes & attributes in-place on mouseenter/mouseleave
+// so hovering onto the front toast never replaces DOM nodes mid-click.
+function syncToastExpandDOM() {
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap) return;
+  const expanded = isToastStackExpanded();
+  const list = wrap.querySelector<HTMLElement>(".toast-list");
+  if (list) {
+    list.classList.toggle("expanded", expanded);
+    list.classList.toggle("collapsed", !expanded);
+    list.querySelectorAll<HTMLElement>(".toast-card").forEach((card, idx) => {
+      const pos = expanded ? "expanded" : idx === 0 ? "0" : idx === 1 ? "1" : idx === 2 ? "2" : "hidden";
+      card.dataset.stackPos = pos;
+    });
+  }
+  const label = wrap.querySelector<HTMLElement>("#toastToggleStack .toast-toggle-label");
+  if (label) {
+    label.textContent = expanded ? "COLLAPSE" : "NOTIFICATIONS";
+  }
+}
+
+function renderToastCard(t: ToastEntry, idx: number, expanded: boolean): string {
+  const stackPos = expanded ? "expanded" : idx === 0 ? "0" : idx === 1 ? "1" : idx === 2 ? "2" : "hidden";
+  const enterCls = t.id === justAddedToastId ? " toast-enter" : "";
+  const dismissBtn = `<span class="icon-x toast-close" data-toast-id="${t.id}" title="Dismiss">${svg(IC_X, 14)}</span>`;
+
+  if (t.kind === "done") {
+    const item = t.item;
+    return `
+      <div class="banner toast toast-card${enterCls}" data-toast-id="${t.id}" data-stack-pos="${stackPos}">
+        <span class="ok">${svg(IC_CHECK, 18, 2.5)}</span>
+        <div class="b-txt">
+          <span class="b-ttl">DONE — SAVED TO DISK</span>
+          <span class="b-sub" title="${esc(item.path ?? "")}">${esc(item.path ?? item.title)}${item.sizeLabel ? ` · ${item.sizeLabel}` : ""}</span>
+        </div>
+        ${item.path ? `<button class="btn btn-primary open-hist" data-path="${esc(item.path)}" style="flex:none">OPEN FOLDER</button>` : ""}
+        ${dismissBtn}
+      </div>`;
+  }
+
+  if (t.kind === "error") {
+    return `
+      <div class="banner toast toast-card error${enterCls}" data-toast-id="${t.id}" data-stack-pos="${stackPos}">
+        <span class="ok">${svg(IC_ALERT, 18, 2)}</span>
+        <div class="b-txt">
+          <span class="b-ttl">COULDN'T DO THAT</span>
+          <span class="b-sub toast-err-msg">${esc(t.message)}</span>
+        </div>
+        ${t.formatHint && state.installers?.available ? `<button class="btn btn-primary toast-update-ytdlp" data-toast-id="${t.id}" style="flex:none">UPDATE YT-DLP</button>` : ""}
+        <button class="btn btn-secondary toast-learn-more" data-toast-id="${t.id}" data-homebrew="${t.homebrewHint ? "1" : "0"}" data-cookie="${t.cookieHint ? "1" : "0"}" style="flex:none">${t.homebrewHint ? "LEARN HOW" : "LEARN MORE"}</button>
+        ${dismissBtn}
+      </div>`;
+  }
+
+  const rows = t.items
+    .map(
+      (it) => `<div class="update-row" data-row-tool="${esc(it.tool)}" style="display:contents">
+        <div class="b-txt">
+          <span class="b-ttl">${esc(it.label.toUpperCase())} UPDATE AVAILABLE</span>
+          <span class="b-sub">${esc(it.from || "?")} → ${esc(it.to || "?")}</span>
+        </div>
+        <button class="btn btn-primary update-tool-btn" data-toast-id="${t.id}" data-tool="${esc(it.tool)}" style="flex:none">UPDATE</button>
+      </div>`
+    )
+    .join("");
+  return `
+    <div class="banner toast toast-card${enterCls}" data-toast-id="${t.id}" data-stack-pos="${stackPos}" id="updateToast">
+      <span class="ok">${svg(IC_ARROW_UP, 18, 2.5)}</span>
+      ${rows}
+      ${dismissBtn}
+    </div>`;
+}
+
+function renderToasts() {
+  const wrap = document.getElementById("toastWrap");
+  if (!wrap || !toasts.length) return;
+  const wasHidden = wrap.classList.contains("hidden");
+  const expanded = isToastStackExpanded();
+  wrap.classList.remove("hidden");
+
+  const barHtml = toasts.length > 1
+    ? `<div class="toast-bar">
+        <button type="button" class="toast-pill toast-toggle-stack" id="toastToggleStack">
+          <span class="toast-badge">${toasts.length}</span>
+          <span class="toast-toggle-label">${expanded ? "COLLAPSE" : "NOTIFICATIONS"}</span>
+        </button>
+        <button type="button" class="toast-pill toast-clear-btn" id="toastClearAll">CLEAR ALL ${svg(IC_X, 11)}</button>
+      </div>`
+    : "";
+
+  const cardsHtml = toasts.map((t, idx) => renderToastCard(t, idx, expanded)).join("");
+  justAddedToastId = null;
+
+  wrap.innerHTML = `
+    ${barHtml}
+    <div class="toast-list ${expanded ? "expanded" : "collapsed"}" data-count="${Math.min(toasts.length, 3)}">
+      ${cardsHtml}
+    </div>`;
+
+  wrap.querySelector<HTMLElement>("#toastToggleStack")?.addEventListener("click", () => {
+    const next = !isToastStackExpanded();
+    toastPinnedExpanded = next;
+    toastHoverExpanded = next;
+    syncToastExpandDOM();
+  });
+  wrap.querySelector<HTMLElement>("#toastClearAll")?.addEventListener("click", clearAllToasts);
+
+  wrap.querySelectorAll<HTMLElement>(".toast-close").forEach((btn) =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      dismissToast(Number(btn.dataset.toastId));
+    })
+  );
+  wrap.querySelectorAll<HTMLElement>(".open-hist").forEach((btn) =>
+    btn.addEventListener("click", (e) =>
+      invoke("reveal_in_folder", { path: (e.currentTarget as HTMLElement).dataset.path })
+    )
+  );
+  wrap.querySelectorAll<HTMLElement>(".toast-update-ytdlp").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      dismissToast(Number(btn.dataset.toastId));
+      startToolUpdate("yt-dlp");
+    })
+  );
+  wrap.querySelectorAll<HTMLElement>(".toast-learn-more").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      openHelp(btn.dataset.homebrew === "1" ? "homebrew" : "download", btn.dataset.cookie === "1");
+    })
+  );
+  wrap.querySelectorAll<HTMLButtonElement>(".update-tool-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const tool = btn.dataset.tool!;
+      dismissToast(Number(btn.dataset.toastId), false);
+      startToolUpdate(tool);
+    })
+  );
+
+  if (wasHidden) {
+    requestAnimationFrame(() => wrap.classList.add("open"));
+  } else {
+    wrap.classList.add("open");
+  }
 }
 
 // ── update checking ─────────────────────────────────────────────────────
@@ -1363,10 +1525,10 @@ function dismissToast() {
 // changes, so a stale copy silently breaks — this pings once at startup
 // (and on demand from Settings) and surfaces a toast that stays up until
 // the user closes it or applies the update, never a blocking screen.
-function pendingUpdateItems(): { tool: string; label: string; from?: string; to?: string }[] {
+function pendingUpdateItems(): UpdateToastItem[] {
   const result = state.updateCheck;
   if (!result) return [];
-  const items: { tool: string; label: string; from?: string; to?: string }[] = [];
+  const items: UpdateToastItem[] = [];
   if (result.ytDlp.updateAvailable) {
     items.push({ tool: "yt-dlp", label: "yt-dlp", from: result.ytDlp.current, to: result.ytDlp.latest });
   }
@@ -1376,20 +1538,12 @@ function pendingUpdateItems(): { tool: string; label: string; from?: string; to?
   return items;
 }
 
-function maybeResurfaceUpdateToast() {
-  if (updateToastDismissedManually) return;
-  const items = pendingUpdateItems();
-  if (items.length) showUpdateToast(items);
-}
-
 async function checkForUpdates(opts: { toast: boolean } = { toast: true }) {
   try {
     state.updateCheck = await invoke<UpdateCheck>("check_for_updates");
     if (!opts.toast) return;
     const items = pendingUpdateItems();
-    // Don't steal the slot from an in-progress download-completion toast —
-    // it'll resurface on its own once that one clears.
-    if (items.length && activeToastKind !== "done") showUpdateToast(items);
+    if (items.length && !updateToastDismissedManually) showUpdateToast(items);
   } catch { }
 }
 
@@ -1412,39 +1566,15 @@ async function loadInstalledVersions() {
   } catch { }
 }
 
-function showUpdateToast(items: { tool: string; label: string; from?: string; to?: string }[]) {
-  const wrap = document.getElementById("toastWrap");
-  if (!wrap || !items.length) return;
-  window.clearTimeout(toastCleanupTimer);
-  window.clearTimeout(toastAutoTimer); // stays up until dismissed or updated — no auto-hide
-  activeToastKind = "update";
-  wrap.classList.remove("hidden");
-  const rows = items
-    .map(
-      (it) => `<div class="update-row" data-row-tool="${esc(it.tool)}" style="display:contents">
-        <div class="b-txt">
-          <span class="b-ttl">${esc(it.label.toUpperCase())} UPDATE AVAILABLE</span>
-          <span class="b-sub">${esc(it.from || "?")} → ${esc(it.to || "?")}</span>
-        </div>
-        <button class="btn btn-primary update-tool-btn" data-tool="${esc(it.tool)}" style="flex:none">UPDATE</button>
-      </div>`
-    )
-    .join("");
-  wrap.innerHTML = `
-    <div class="banner toast" id="updateToast">
-      <span class="ok">${svg(IC_ARROW_UP, 18, 2.5)}</span>
-      ${rows}
-      <span class="icon-x" id="updateToastClose">${svg(IC_X, 14)}</span>
-    </div>`;
-  wrap.querySelectorAll<HTMLButtonElement>(".update-tool-btn").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      const tool = btn.dataset.tool!;
-      dismissToast();
-      startToolUpdate(tool);
-    })
-  );
-  document.getElementById("updateToastClose")?.addEventListener("click", dismissToast);
-  requestAnimationFrame(() => wrap.classList.add("open"));
+function showUpdateToast(items: UpdateToastItem[]) {
+  if (!items.length) return;
+  const existing = toasts.find((t): t is Extract<ToastEntry, { kind: "update" }> => t.kind === "update");
+  if (existing) {
+    existing.items = items;
+    renderToasts();
+    return;
+  }
+  pushToast({ id: nextToastId++, kind: "update", items });
 }
 
 let installCancelRequested = false;
@@ -1556,7 +1686,8 @@ async function pickDir() {
   const picked = await openDialog({ directory: true, defaultPath: state.outputDir });
   if (typeof picked === "string") {
     state.outputDir = picked;
-    dirPinned = true;
+    state.dirPinned = true;
+    state.hasSavedOutputDir = true;
     persistSettings();
     render();
   }
@@ -1930,12 +2061,24 @@ function wireChrome() {
   $("#winMinimize")?.addEventListener("click", () => win.minimize());
   $("#winClose")?.addEventListener("click", () => win.close());
 
-  // pause the toast's auto-dismiss while the pointer is over it — only
-  // applies to "done"/"error" toasts; "update" toasts have no timer to re-arm
+  // Expand notification stack on hover and collapse after a short grace delay
+  // unless pinned open via the toggle pill (no auto-dismiss timers).
   const toastWrap = $("#toastWrap")!;
-  toastWrap.addEventListener("mouseenter", () => window.clearTimeout(toastAutoTimer));
+  toastWrap.addEventListener("mouseenter", () => {
+    window.clearTimeout(toastHoverLeaveTimer);
+    if (toasts.length > 1 && !toastHoverExpanded) {
+      toastHoverExpanded = true;
+      syncToastExpandDOM();
+    }
+  });
   toastWrap.addEventListener("mouseleave", () => {
-    if (toastWrap.classList.contains("open") && activeToastKind !== "update") armToastTimer();
+    window.clearTimeout(toastHoverLeaveTimer);
+    toastHoverLeaveTimer = window.setTimeout(() => {
+      if (!toastPinnedExpanded && toastHoverExpanded) {
+        toastHoverExpanded = false;
+        syncToastExpandDOM();
+      }
+    }, 180);
   });
 
   // Global paste handler: pasting a URL anywhere in the app automatically loads and analyzes it

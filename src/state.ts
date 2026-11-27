@@ -27,6 +27,7 @@ export const state = {
   checkingUpdates: false,
   outputDir: "",
   hasSavedOutputDir: false,
+  dirPinned: false,
   url: "",
   analyzingId: null as string | null,
   analysis: null as AnalyzeResult | null,
@@ -115,6 +116,7 @@ export function persistSettings() {
       "fetch.settings",
       JSON.stringify({
         outputDir: state.outputDir,
+        dirPinned: state.dirPinned,
         cookieMode: state.cookieMode,
         cookieBrowser: state.cookieBrowser,
         cookieFile: state.cookieFile,
@@ -128,9 +130,10 @@ export function loadSettings() {
     const raw = localStorage.getItem("fetch.settings");
     if (!raw) return;
     const s = JSON.parse(raw);
-    if (typeof s.outputDir === "string" && s.outputDir) {
+    if (s.dirPinned === true && typeof s.outputDir === "string" && s.outputDir) {
       state.outputDir = s.outputDir;
       state.hasSavedOutputDir = true;
+      state.dirPinned = true;
     }
     if (s.cookieMode === "file") {
       state.cookieMode = "file";
